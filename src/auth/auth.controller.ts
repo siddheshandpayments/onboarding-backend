@@ -1,19 +1,17 @@
-import { Body, Controller, Param, ParseUUIDPipe, Post } from '@nestjs/common';
+import { Body, Controller, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { CreateUserDto } from './dto/create-user.dto';
-import {
-  VerifyPasswordDto,
-  TotpEnrollDto,
-  TotpConfirmDto,
-  CompletePasswordResetDto,
-} from './dto/totp-and-reset.dto';
+import { LoginDto, TotpCodeDto, CompletePasswordResetDto } from './dto/totp-and-reset.dto';
+import { PreAuthGuard } from './guards/pre-auth.guard';
+import { RefreshGuard } from './guards/refresh.guard';
+import { PreAuthUser, PreAuthContext } from './decorators/pre-auth-user.decorator';
+import { RefreshUser } from './decorators/refresh-user.decorator';
 
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   // TODO(step 7 RolesGuard): only superadmin_hr may create accounts.
-  // Not enforced yet — same gap flagged on TemplatesController.
   @Post('users')
   createUser(@Body() dto: CreateUserDto) {
     return this.authService.createUser(dto);
@@ -25,50 +23,65 @@ export class AuthController {
     return this.authService.regenerateCredentials(id);
   }
 
-  // --- Step 5: password + TOTP state machine ---
-  // TODO(step 6): these should be chained behind a short-lived pre-auth
-  // token issued by verify-password, not a raw userId in every body.
-  // Anyone who learns a userId can currently call the TOTP/reset
-  // endpoints for it — real gap, tracked, not yet closed.
+  // --- Login flow ---
+  // Every step below except /login itself requires a valid pre-auth
+  // token (Authorization: Bearer <preAuthToken>), obtained from the
+  // previous step's response. Identity comes from that token via
+  // @PreAuthUser(), never from the request body.
 
-  @Post('login/verify-password')
-  verifyPassword(@Body() dto: VerifyPasswordDto) {
-    return this.authService.verifyPassword(dto.loginIdentifier, dto.password);
+  @Post('login')
+  login(@Body() dto: LoginDto) {
+    return this.authService.login(dto.loginIdentifier, dto.password);
   }
 
+  @UseGuards(PreAuthGuard)
   @Post('totp/enroll')
-  startTotpEnrollment(@Body() dto: TotpEnrollDto) {
-    return this.authService.startTotpEnrollment(dto.userId);
+  startTotpEnrollment(@PreAuthUser() ctx: PreAuthContext) {
+    return this.authService.startTotpEnrollment(ctx.userId);
   }
 
+  @UseGuards(PreAuthGuard)
   @Post('totp/enroll/confirm')
-  confirmTotpEnrollment(@Body() dto: TotpConfirmDto) {
-    return this.authService.confirmTotpEnrollment(dto.userId, dto.code);
+  confirmTotpEnrollment(@PreAuthUser() ctx: PreAuthContext, @Body() dto: TotpCodeDto) {
+    return this.authService.confirmTotpEnrollment(ctx.userId, dto.code);
   }
 
+  @UseGuards(PreAuthGuard)
   @Post('totp/verify')
-  verifyTotp(@Body() dto: TotpConfirmDto) {
-    return this.authService.verifyTotpForLogin(dto.userId, dto.code);
+  verifyTotp(@PreAuthUser() ctx: PreAuthContext, @Body() dto: TotpCodeDto) {
+    return this.authService.verifyTotpForLogin(ctx.userId, dto.code);
   }
 
+  @UseGuards(PreAuthGuard)
   @Post('first-login/complete-password')
-  completeFirstLoginPasswordReset(@Body() dto: CompletePasswordResetDto) {
+  completeFirstLoginPasswordReset(
+    @PreAuthUser() ctx: PreAuthContext,
+    @Body() dto: CompletePasswordResetDto,
+  ) {
     return this.authService.completeFirstLoginPasswordReset(
-      dto.userId,
+      ctx.userId,
       dto.newPassword,
+      ctx.totpVerified,
     );
   }
 
+  @UseGuards(PreAuthGuard)
   @Post('company-email/complete-password')
-  completeCompanyEmailPasswordReset(@Body() dto: CompletePasswordResetDto) {
+  completeCompanyEmailPasswordReset(
+    @PreAuthUser() ctx: PreAuthContext,
+    @Body() dto: CompletePasswordResetDto,
+  ) {
     return this.authService.completeCompanyEmailPasswordReset(
-      dto.userId,
+      ctx.userId,
       dto.newPassword,
+      ctx.totpVerified,
     );
   }
 
-  // Full login (Step 6) chains verify-password → totp/enroll or
-  // totp/verify → issues JWT access + refresh tokens. Not built yet —
-  // this controller so far covers steps 4 & 5's scope only.
+  // --- Token refresh ---
+  @UseGuards(RefreshGuard)
+  @Post('refresh')
+  refresh(@RefreshUser() userId: string) {
+    return this.authService.refreshAccessToken(userId);
+  }
 }
-
