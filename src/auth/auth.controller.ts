@@ -4,6 +4,9 @@ import { CreateUserDto } from './dto/create-user.dto';
 import { LoginDto, TotpCodeDto, CompletePasswordResetDto } from './dto/totp-and-reset.dto';
 import { PreAuthGuard } from './guards/pre-auth.guard';
 import { RefreshGuard } from './guards/refresh.guard';
+import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { RolesGuard } from './guards/roles.guard';
+import { Roles } from './decorators/roles.decorator';
 import { PreAuthUser, PreAuthContext } from './decorators/pre-auth-user.decorator';
 import { RefreshUser } from './decorators/refresh-user.decorator';
 
@@ -11,13 +14,15 @@ import { RefreshUser } from './decorators/refresh-user.decorator';
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
-  // TODO(step 7 RolesGuard): only superadmin_hr may create accounts.
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('superadmin_hr')
   @Post('users')
   createUser(@Body() dto: CreateUserDto) {
     return this.authService.createUser(dto);
   }
 
-  // TODO(step 7 RolesGuard): only superadmin_hr may regenerate credentials.
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('superadmin_hr')
   @Post('users/:id/regenerate-credentials')
   regenerateCredentials(@Param('id', ParseUUIDPipe) id: string) {
     return this.authService.regenerateCredentials(id);
