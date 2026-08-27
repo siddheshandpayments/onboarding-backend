@@ -1,6 +1,9 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { DatabaseModule } from './database/database.module';
+import { TemplatesModule } from './templates/templates.module';
+import { UsersModule } from './users/users.module';
+import { AuthModule } from './auth/auth.module';
 
 @Module({
   imports: [
@@ -11,7 +14,10 @@ import { DatabaseModule } from './database/database.module';
       envFilePath: '.env',
     }),
     DatabaseModule,
-    // Feature modules (AuthModule, UsersModule, TemplatesModule, ...)
+    TemplatesModule,
+    UsersModule,
+    AuthModule,
+    // Remaining feature modules (OnboardingsModule, KnowledgeModule, ...)
     // get added here as later steps build them.
   ],
 })
