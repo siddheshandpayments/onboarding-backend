@@ -1,11 +1,24 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { PoolClient } from 'pg';
+import { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { DatabaseService } from '../database/database.service';
 import { CreateTemplateDto } from './dto/create-template.dto';
 import { NewTemplateVersionDto } from './dto/new-template-version.dto';
 import { TemplateTaskInputDto } from './dto/template-task-input.dto';
 
-interface TemplateRow {
+/** Structural type both DatabaseService and pg's PoolClient satisfy.
+ *  Typing against `DatabaseService | PoolClient` directly doesn't work —
+ *  PoolClient.query is overloaded several different ways and TS can't
+ *  safely call through the merged union of two different overload
+ *  sets. A single-signature interface sidesteps that: TS just checks
+ *  each concrete type is structurally assignable to it, which both are. */
+interface Queryable {
+  query<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    params?: unknown[],
+  ): Promise<QueryResult<T>>;
+}
+
+export interface TemplateRow {
   id: string;
   department_id: string;
   name: string;
@@ -14,7 +27,7 @@ interface TemplateRow {
   created_at: Date;
 }
 
-interface TemplateTaskRow {
+export interface TemplateTaskRow {
   id: string;
   template_id: string;
   title: string;
@@ -146,10 +159,10 @@ export class TemplatesService {
   }
 
   /** Accepts either the pooled DatabaseService or a transaction's
-   *  PoolClient — both expose .query() with the same shape, so the
-   *  same read logic works whether called mid-transaction or standalone. */
+   *  PoolClient — both structurally satisfy Queryable, so the same read
+   *  logic works whether called mid-transaction or standalone. */
   private async toTemplateWithTasks(
-    queryable: DatabaseService | PoolClient,
+    queryable: Queryable,
     templateId: string,
   ) {
     const { rows: templateRows } = await queryable.query<TemplateRow>(

@@ -43,8 +43,8 @@ export class UsersService {
   }): Promise<UserRow> {
     const { rows } = await this.db.query<UserRow>(
       `INSERT INTO users
-         (full_name, phone_number, temp_login_email, password_hash, role, department_id, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'invited')
+         (full_name, phone_number, temp_login_email, password_hash, role, department_id, status, must_reset_password)
+       VALUES ($1, $2, $3, $4, $5, $6, 'invited', true)
        RETURNING *`,
       [
         fields.fullName,
@@ -107,6 +107,36 @@ export class UsersService {
       `UPDATE users SET password_hash = $2, must_reset_password = $3 WHERE id = $1`,
       [userId, passwordHash, forceReset],
     );
+  }
+
+  /** Stores a freshly-generated TOTP secret, pending confirmation
+   *  (totp_enrolled_at stays NULL until the user proves they can
+   *  generate a valid code from it). */
+  async setPendingTotpSecret(userId: string, secret: string) {
+    await this.db.query(
+      `UPDATE users SET totp_secret = $2, totp_enrolled_at = NULL WHERE id = $1`,
+      [userId, secret],
+    );
+  }
+
+  async markTotpEnrolled(userId: string) {
+    await this.db.query(
+      `UPDATE users SET totp_enrolled_at = now() WHERE id = $1`,
+      [userId],
+    );
+  }
+
+  async setCompanyEmailActive(userId: string) {
+    await this.db.query(
+      `UPDATE users SET company_email_active = true WHERE id = $1`,
+      [userId],
+    );
+  }
+
+  async activateUser(userId: string) {
+    await this.db.query(`UPDATE users SET status = 'active' WHERE id = $1`, [
+      userId,
+    ]);
   }
 
   /** Strips fields that must never leave the API, and additionally hides
