@@ -238,20 +238,30 @@ export class OnboardingsService {
   }
 
   /**
-   * "What's stuck": one row per required, not-yet-done task that is
-   * either explicitly blocked or already past its due date, on an
-   * onboarding that hasn't finished. Overdue (Step 25) is
-   * isOverdueSql('ot.') — the same definition every other dashboard
-   * uses, not a locally re-typed condition.
+   * Step 26: the single-screen "what's stuck" view — one row per
+   * required, not-yet-done task that is either explicitly blocked or
+   * overdue, on an onboarding that hasn't finished. isOverdueSql
+   * (Step 25) now excludes 'locked' tasks, so a phase-2 task sitting
+   * behind an unconfirmed checkpoint no longer floods this view with
+   * false positives — if an onboarding is stuck because the checkpoint
+   * itself hasn't been confirmed, THAT task is what shows up here
+   * (is_checkpoint = true on the row makes it obvious at a glance which
+   * kind of "stuck" it is), not every locked task behind it.
+   *
+   * onboarding_status is included so HR can immediately see whether a
+   * stuck onboarding is still pre-checkpoint or already active but
+   * lagging — the two call for different follow-up.
    */
   async listStuckTasks() {
     const { rows } = await this.db.query(
       `SELECT
          o.id AS onboarding_id,
+         o.status AS onboarding_status,
          u.full_name AS employee_name,
          d.name AS department_name,
          ot.id AS task_id,
          ot.title AS task_title,
+         ot.is_checkpoint,
          ot.due_date,
          ot.status AS task_status,
          ot.blocked_reason,
