@@ -2,6 +2,8 @@ import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } f
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { OnboardingsService } from './onboardings.service';
 import { CreateOnboardingDto } from './dto/create-onboarding.dto';
 import { ProvisionCompanyEmailDto } from './dto/provision-company-email.dto';
@@ -56,5 +58,16 @@ export class OnboardingsController {
   @Get('stuck')
   listStuck() {
     return this.onboardingsService.listStuckTasks();
+  }
+
+  // Step 21: Employee dashboard. Scoped server-side to the caller's
+  // own onboarding (OnboardingsService.findByUserId(actor.id)) — never
+  // an id from the URL or query string, so there's no path to another
+  // employee's onboarding here at all, not even a hidden one.
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('employee')
+  @Get('me')
+  getMine(@CurrentUser() user: AuthenticatedUser) {
+    return this.onboardingsService.getMyDashboard(user);
   }
 }

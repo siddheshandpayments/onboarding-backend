@@ -11,6 +11,7 @@ import { TemplatesService } from '../templates/templates.service';
 import { CreateOnboardingDto } from './dto/create-onboarding.dto';
 import { ProvisionCompanyEmailDto } from './dto/provision-company-email.dto';
 import { computeDueDate } from './utils/due-date.util';
+import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 
 /** Same structural-typing trick as TemplatesService — lets the read
  *  helper below run against either the pooled DatabaseService or a
@@ -267,6 +268,84 @@ export class OnboardingsService {
        ORDER BY ot.due_date`,
     );
     return rows;
+  }
+
+  /**
+   * Step 21: Employee dashboard — the caller's own onboarding, bucketed
+   * into today/upcoming/overdue, plus progress computed live from
+   * required tasks only (never a stored/editable field — same rule as
+   * everywhere else in this codebase).
+   *
+   * 'locked' tasks are excluded from all three time buckets: their
+   * due_date was computed from start_date + offset regardless of when
+   * the checkpoint actually completes, so a locked phase-2 task can
+   * easily show a due_date in the past through no fault of the
+   * employee's — surfacing that as "overdue" would be actively
+   * misleading. They still count toward the progress denominator,
+   * since progress means "of everything in my plan," not "of
+   * everything I can currently act on."
+   */
+  async getMyDashboard(actor: AuthenticatedUser) {
+    const onboarding = await this.findByUserId(actor.id);
+    if (!onboarding) {
+      throw new NotFoundException('No onboarding found for this account');
+    }
+
+    const { rows: bucketedTasks } = await this.db.query<{
+      id: string;
+      title: string;
+      description: string | null;
+      owner_role: string;
+      due_date: Date;
+      priority: string;
+      is_required: boolean;
+      completion_mode: string;
+      is_checkpoint: boolean;
+      status: string;
+      blocked_reason: string | null;
+      bucket: 'overdue' | 'today' | 'upcoming';
+    }>(
+      `SELECT
+         id, title, description, owner_role, due_date, priority, is_required,
+         completion_mode, is_checkpoint, status, blocked_reason,
+         CASE
+           WHEN due_date < CURRENT_DATE THEN 'overdue'
+           WHEN due_date = CURRENT_DATE THEN 'today'
+           ELSE 'upcoming'
+         END AS bucket
+       FROM onboarding_tasks
+       WHERE onboarding_id = $1
+         AND status NOT IN ('locked', 'completed', 'cancelled')
+       ORDER BY due_date`,
+      [onboarding.id],
+    );
+
+    const { rows: progressRows } = await this.db.query<{
+      required_total: string;
+      required_completed: string;
+    }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE is_required) AS required_total,
+         COUNT(*) FILTER (WHERE is_required AND status = 'completed') AS required_completed
+       FROM onboarding_tasks
+       WHERE onboarding_id = $1`,
+      [onboarding.id],
+    );
+    const requiredTotal = Number(progressRows[0].required_total);
+    const requiredCompleted = Number(progressRows[0].required_completed);
+
+    return {
+      onboarding,
+      today: bucketedTasks.filter((t) => t.bucket === 'today'),
+      upcoming: bucketedTasks.filter((t) => t.bucket === 'upcoming'),
+      overdue: bucketedTasks.filter((t) => t.bucket === 'overdue'),
+      progress: {
+        requiredTotal,
+        requiredCompleted,
+        percent:
+          requiredTotal === 0 ? 0 : Math.round((requiredCompleted / requiredTotal) * 100),
+      },
+    };
   }
 
   /** Used by ClaimedAccountGuard (KnowledgeModule) to check the caller's
