@@ -8,6 +8,8 @@ import { OnboardingsModule } from './onboardings/onboardings.module';
 import { KnowledgeModule } from './knowledge/knowledge.module';
 import { EntitlementsModule } from './entitlements/entitlements.module';
 import { NotesModule } from './notes/notes.module';
+import { ActivityLogModule } from './activity-log/activity-log.module';
+import { CommunityModule } from './community/community.module';
 
 @Module({
   imports: [
@@ -18,6 +20,7 @@ import { NotesModule } from './notes/notes.module';
       envFilePath: '.env',
     }),
     DatabaseModule,
+    ActivityLogModule,
     TemplatesModule,
     UsersModule,
     AuthModule,
@@ -25,6 +28,7 @@ import { NotesModule } from './notes/notes.module';
     KnowledgeModule,
     EntitlementsModule,
     NotesModule,
+    CommunityModule,
     // Remaining feature modules get added here as later steps build them.
   ],
 })
