@@ -15,6 +15,41 @@ import { computeDueDate } from './utils/due-date.util';
 import { isOverdueSql } from './utils/overdue.util';
 import { toCsv } from './utils/csv.util';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+import {
+  assertDateIfPresent,
+  assertOneOfIfPresent,
+  assertOnlyAllowedKeys,
+  assertUuidIfPresent,
+  parseSort,
+} from '../common/list-query.util';
+
+const ONBOARDING_STATUS_VALUES = [
+  'pre_onboarding',
+  'email_provisioned',
+  'checkpoint_pending',
+  'active',
+  'completed',
+  'cancelled',
+] as const;
+const HEALTH_VALUES = ['stuck', 'on_track'] as const;
+const PRIORITY_VALUES = ['low', 'normal', 'high'] as const;
+
+/** Column names as they appear in listAllOnboardings' OUTER query (the
+ *  wrapping SELECT * FROM (...) — bare column/alias names, not
+ *  table-prefixed), so ORDER BY can reference them directly. Built
+ *  from a fixed dictionary keyed by the already-allow-listed sort
+ *  field name — never the client's raw sort string. */
+const ONBOARDING_SORT_EXPRESSIONS: Record<string, string> = {
+  name: 'employee_name',
+  startDate: 'start_date',
+  progress: `CASE WHEN required_task_count = 0 THEN 0
+               ELSE ROUND(100.0 * required_task_completed_count / required_task_count) END`,
+};
+
+const STUCK_SORT_EXPRESSIONS: Record<string, string> = {
+  dueDate: 'ot.due_date',
+  priority: `CASE ot.priority WHEN 'high' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END`,
+};
 
 /** Same structural-typing trick as TemplatesService — lets the read
  *  helper below run against either the pooled DatabaseService or a
@@ -231,57 +266,92 @@ export class OnboardingsService {
   }
 
   /**
-   * SuperAdmin/HR dashboard: every onboarding, company-wide, with
-   * enough joined context (employee/department/template names, a live
-   * required-task progress count) to actually be a dashboard row
-   * rather than a bare foreign-key dump. Progress is two plain COUNT
-   * subqueries against onboarding_tasks, never a stored column — same
-   * "computed live, no drift possible" rule as everywhere else.
+   * Step 32: SuperAdmin/HR dashboard, now with an allow-listed filter
+   * and sort surface instead of the two ad-hoc equality params this
+   * had through Step 28. `query` is the FULL, raw query object —
+   * assertOnlyAllowedKeys rejects (400) any key outside
+   * ['department','status','health','dateFrom','dateTo','sort']
+   * rather than silently ignoring a typo'd or probing one.
    *
-   * Filters are optional equality only (`$n::type IS NULL OR ...`),
-   * bound as query parameters rather than string-built — no dynamic
-   * SQL. Neither departmentId nor status is validated against an
-   * allow-list yet; an unknown status just yields zero rows. Step 32
-   * generalizes this properly across every list endpoint.
+   * `health` is derived, not stored: 'stuck' means at least one
+   * required task on the onboarding is blocked or overdue (the exact
+   * Step 25/26 definition, via EXISTS/isOverdueSql), 'on_track' means
+   * none are. Progress is still two plain COUNT subqueries, never a
+   * stored column — same rule as everywhere else — and 'progress' as a
+   * sort field is computed from those same two counts via a fixed
+   * (never client-supplied) SQL expression, applied only after the
+   * allow-list check has already validated the requested sort field.
    */
-  async listAllOnboardings(filters: { departmentId?: string; status?: string }) {
+  async listAllOnboardings(query: Record<string, string | undefined>) {
+    assertOnlyAllowedKeys(query, ['department', 'status', 'health', 'dateFrom', 'dateTo', 'sort']);
+    assertUuidIfPresent(query.department, 'department');
+    assertOneOfIfPresent(query.status, 'status', ONBOARDING_STATUS_VALUES);
+    assertOneOfIfPresent(query.health, 'health', HEALTH_VALUES);
+    assertDateIfPresent(query.dateFrom, 'dateFrom');
+    assertDateIfPresent(query.dateTo, 'dateTo');
+    const { field, direction } = parseSort(
+      query.sort,
+      Object.keys(ONBOARDING_SORT_EXPRESSIONS),
+      'startDate',
+    );
+
+    const stuckExists = `EXISTS (
+      SELECT 1 FROM onboarding_tasks ot2
+      WHERE ot2.onboarding_id = o.id AND ot2.is_required = true
+        AND (ot2.status = 'blocked' OR ${isOverdueSql('ot2.')})
+    )`;
+    // Resolved from the already-validated `health` value above, one of
+    // exactly three fixed literal strings — never client-interpolated.
+    const healthCondition =
+      query.health === 'stuck' ? stuckExists : query.health === 'on_track' ? `NOT ${stuckExists}` : 'true';
+
     const { rows } = await this.db.query(
-      `SELECT
-         o.id, o.user_id, o.department_id, o.template_id, o.template_version,
-         o.start_date, o.status, o.created_at, o.updated_at,
-         u.full_name AS employee_name,
-         d.name AS department_name,
-         t.name AS template_name,
-         (SELECT COUNT(*) FROM onboarding_tasks ot
-            WHERE ot.onboarding_id = o.id AND ot.is_required = true) AS required_task_count,
-         (SELECT COUNT(*) FROM onboarding_tasks ot
-            WHERE ot.onboarding_id = o.id AND ot.is_required = true
-              AND ot.status = 'completed') AS required_task_completed_count
-       FROM onboardings o
-       JOIN users u ON u.id = o.user_id
-       JOIN departments d ON d.id = o.department_id
-       JOIN onboarding_templates t ON t.id = o.template_id
-       WHERE ($1::uuid IS NULL OR o.department_id = $1)
-         AND ($2::text IS NULL OR o.status = $2)
-       ORDER BY o.created_at DESC`,
-      [filters.departmentId ?? null, filters.status ?? null],
+      `SELECT * FROM (
+         SELECT
+           o.id, o.user_id, o.department_id, o.template_id, o.template_version,
+           o.start_date, o.status, o.created_at, o.updated_at,
+           u.full_name AS employee_name,
+           d.name AS department_name,
+           t.name AS template_name,
+           (SELECT COUNT(*) FROM onboarding_tasks ot
+              WHERE ot.onboarding_id = o.id AND ot.is_required = true)::int AS required_task_count,
+           (SELECT COUNT(*) FROM onboarding_tasks ot
+              WHERE ot.onboarding_id = o.id AND ot.is_required = true
+                AND ot.status = 'completed')::int AS required_task_completed_count
+         FROM onboardings o
+         JOIN users u ON u.id = o.user_id
+         JOIN departments d ON d.id = o.department_id
+         JOIN onboarding_templates t ON t.id = o.template_id
+         WHERE ($1::uuid IS NULL OR o.department_id = $1)
+           AND ($2::text IS NULL OR o.status = $2)
+           AND ($3::date IS NULL OR o.start_date >= $3)
+           AND ($4::date IS NULL OR o.start_date <= $4)
+           AND ${healthCondition}
+       ) AS onboarding_rows
+       ORDER BY ${ONBOARDING_SORT_EXPRESSIONS[field]} ${direction}`,
+      [query.department ?? null, query.status ?? null, query.dateFrom ?? null, query.dateTo ?? null],
     );
     return rows;
   }
 
   /**
-   * Step 28: CSV export, one row per onboarding_task across every
-   * onboarding. This query never joins or selects from the notes
+   * Step 28's CSV export, now sharing Step 32's same allow-listed
+   * filters as listAllOnboardings (department/status/dateFrom/dateTo —
+   * no health/sort here, an export doesn't need ordering the way a UI
+   * list does). This query never joins or selects from the notes
    * table, anywhere — not filtered out, structurally absent. "Notes
    * never appear in export, log, search, or any admin-facing query" is
    * a non-negotiable precisely because a filter is something a future
    * edit could accidentally loosen; a table that was never joined in
    * the first place can't leak through one.
-   *
-   * Same optional-equality filters as listAllOnboardings, same caveat:
-   * not allow-listed yet (Step 32).
    */
-  async exportOnboardingsCsv(filters: { departmentId?: string; status?: string }): Promise<string> {
+  async exportOnboardingsCsv(query: Record<string, string | undefined>): Promise<string> {
+    assertOnlyAllowedKeys(query, ['department', 'status', 'dateFrom', 'dateTo']);
+    assertUuidIfPresent(query.department, 'department');
+    assertOneOfIfPresent(query.status, 'status', ONBOARDING_STATUS_VALUES);
+    assertDateIfPresent(query.dateFrom, 'dateFrom');
+    assertDateIfPresent(query.dateTo, 'dateTo');
+
     const { rows } = await this.db.query(
       `SELECT
          u.full_name AS employee_name,
@@ -304,8 +374,10 @@ export class OnboardingsService {
        JOIN onboarding_templates t ON t.id = o.template_id
        WHERE ($1::uuid IS NULL OR o.department_id = $1)
          AND ($2::text IS NULL OR o.status = $2)
+         AND ($3::date IS NULL OR o.start_date >= $3)
+         AND ($4::date IS NULL OR o.start_date <= $4)
        ORDER BY d.name, u.full_name, ot.due_date`,
-      [filters.departmentId ?? null, filters.status ?? null],
+      [query.department ?? null, query.status ?? null, query.dateFrom ?? null, query.dateTo ?? null],
     );
 
     const columns = [
@@ -340,8 +412,21 @@ export class OnboardingsService {
    * onboarding_status is included so HR can immediately see whether a
    * stuck onboarding is still pre-checkpoint or already active but
    * lagging — the two call for different follow-up.
+   *
+   * Step 32 adds an allow-listed filter/sort surface: `department`,
+   * `owner` (the claimed task_owner's user id, Step 20), and `priority`
+   * as filters; `dueDate`/`priority` as sort fields. `owner` belongs
+   * here rather than on listAllOnboardings — there's no single "owner"
+   * of an onboarding, but every stuck row IS one specific task, which
+   * does have one.
    */
-  async listStuckTasks() {
+  async listStuckTasks(query: Record<string, string | undefined>) {
+    assertOnlyAllowedKeys(query, ['department', 'owner', 'priority', 'sort']);
+    assertUuidIfPresent(query.department, 'department');
+    assertUuidIfPresent(query.owner, 'owner');
+    assertOneOfIfPresent(query.priority, 'priority', PRIORITY_VALUES);
+    const { field, direction } = parseSort(query.sort, Object.keys(STUCK_SORT_EXPRESSIONS), 'dueDate');
+
     const { rows } = await this.db.query(
       `SELECT
          o.id AS onboarding_id,
@@ -351,6 +436,7 @@ export class OnboardingsService {
          ot.id AS task_id,
          ot.title AS task_title,
          ot.is_checkpoint,
+         ot.priority,
          ot.due_date,
          ot.status AS task_status,
          ot.blocked_reason,
@@ -364,7 +450,11 @@ export class OnboardingsService {
          AND ot.is_required = true
          AND ot.status NOT IN ('completed', 'cancelled')
          AND (ot.status = 'blocked' OR ${isOverdueSql('ot.')})
-       ORDER BY ot.due_date`,
+         AND ($1::uuid IS NULL OR o.department_id = $1)
+         AND ($2::uuid IS NULL OR ot.owner_user_id = $2)
+         AND ($3::text IS NULL OR ot.priority = $3)
+       ORDER BY ${STUCK_SORT_EXPRESSIONS[field]} ${direction}`,
+      [query.department ?? null, query.owner ?? null, query.priority ?? null],
     );
     return rows;
   }

@@ -1,4 +1,4 @@
-import { Controller, Get, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -41,11 +41,17 @@ export class OnboardingTasksController {
   }
 
   // Step 20: TaskOwner dashboard. This one IS a fixed role — there's
-  // no per-task ambiguity, it's just "show me what I've claimed."
+  // no per-task ambiguity, it's just "show me what I've claimed." Step
+  // 32: allow-listed status/priority/date-range filters, dueDate/
+  // priority sort — @Query() with no key captures the full query
+  // object so the service can reject unknown keys, not just ignore them.
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('task_owner')
   @Get('mine')
-  listMine(@CurrentUser() user: AuthenticatedUser) {
-    return this.onboardingTasksService.listMyTasks(user);
+  listMine(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query() query: Record<string, string | undefined>,
+  ) {
+    return this.onboardingTasksService.listMyTasks(user, query);
   }
 }

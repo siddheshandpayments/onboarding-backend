@@ -10,6 +10,31 @@ import { DatabaseService } from '../database/database.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { isOverdueSql } from './utils/overdue.util';
+import {
+  assertDateIfPresent,
+  assertOneOfIfPresent,
+  assertOnlyAllowedKeys,
+  parseSort,
+} from '../common/list-query.util';
+
+const TASK_STATUS_VALUES = [
+  'locked',
+  'pending',
+  'in_progress',
+  'blocked',
+  'completed',
+  'cancelled',
+] as const;
+const PRIORITY_VALUES = ['low', 'normal', 'high'] as const;
+
+/** Bare column names as they appear in listMyTasks' OUTER query (the
+ *  wrapping SELECT * FROM (...)) — built from a fixed dictionary keyed
+ *  by the already-allow-listed sort field, never the client's raw
+ *  sort string. */
+const TASK_SORT_EXPRESSIONS: Record<string, string> = {
+  dueDate: 'due_date',
+  priority: `CASE priority WHEN 'high' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END`,
+};
 
 export interface OnboardingTaskRow {
   id: string;
@@ -192,27 +217,47 @@ export class OnboardingTasksService {
     return rows[0];
   }
 
-  /** Step 20: the TaskOwner dashboard. Scoped server-side to
-   *  owner_user_id = actor.id — not a role filter, not a client-
-   *  supplied id — so a task_owner only ever sees tasks they've
-   *  personally claimed, across every onboarding. is_overdue (Step 25)
-   *  uses the same shared definition as the HR and Employee dashboards. */
-  async listMyTasks(actor: AuthenticatedUser) {
+  /**
+   * Step 20: the TaskOwner dashboard. Scoped server-side to
+   * owner_user_id = actor.id — not a role filter, not a client-
+   * supplied id — so a task_owner only ever sees tasks they've
+   * personally claimed, across every onboarding. is_overdue (Step 25)
+   * uses the same shared definition as the HR and Employee dashboards.
+   *
+   * Step 32: allow-listed status/priority/dateFrom/dateTo filters on
+   * top of that base scope, plus dueDate/priority sort. `query` is the
+   * full raw query object so assertOnlyAllowedKeys can reject any key
+   * outside that list rather than silently ignore it.
+   */
+  async listMyTasks(actor: AuthenticatedUser, query: Record<string, string | undefined>) {
+    assertOnlyAllowedKeys(query, ['status', 'priority', 'dateFrom', 'dateTo', 'sort']);
+    assertOneOfIfPresent(query.status, 'status', TASK_STATUS_VALUES);
+    assertOneOfIfPresent(query.priority, 'priority', PRIORITY_VALUES);
+    assertDateIfPresent(query.dateFrom, 'dateFrom');
+    assertDateIfPresent(query.dateTo, 'dateTo');
+    const { field, direction } = parseSort(query.sort, Object.keys(TASK_SORT_EXPRESSIONS), 'dueDate');
+
     const { rows } = await this.db.query(
-      `SELECT
-         ot.id, ot.onboarding_id, ot.title, ot.description, ot.due_date,
-         ot.priority, ot.status, ot.completion_mode, ot.is_checkpoint,
-         ot.blocked_reason,
-         ${isOverdueSql('ot.')} AS is_overdue,
-         u.full_name AS employee_name,
-         d.name AS department_name
-       FROM onboarding_tasks ot
-       JOIN onboardings o ON o.id = ot.onboarding_id
-       JOIN users u ON u.id = o.user_id
-       JOIN departments d ON d.id = o.department_id
-       WHERE ot.owner_user_id = $1
-       ORDER BY ot.due_date`,
-      [actor.id],
+      `SELECT * FROM (
+         SELECT
+           ot.id, ot.onboarding_id, ot.title, ot.description, ot.due_date,
+           ot.priority, ot.status, ot.completion_mode, ot.is_checkpoint,
+           ot.blocked_reason,
+           ${isOverdueSql('ot.')} AS is_overdue,
+           u.full_name AS employee_name,
+           d.name AS department_name
+         FROM onboarding_tasks ot
+         JOIN onboardings o ON o.id = ot.onboarding_id
+         JOIN users u ON u.id = o.user_id
+         JOIN departments d ON d.id = o.department_id
+         WHERE ot.owner_user_id = $1
+           AND ($2::text IS NULL OR ot.status = $2)
+           AND ($3::text IS NULL OR ot.priority = $3)
+           AND ($4::date IS NULL OR ot.due_date >= $4)
+           AND ($5::date IS NULL OR ot.due_date <= $5)
+       ) AS task_rows
+       ORDER BY ${TASK_SORT_EXPRESSIONS[field]} ${direction}`,
+      [actor.id, query.status ?? null, query.priority ?? null, query.dateFrom ?? null, query.dateTo ?? null],
     );
     return rows;
   }

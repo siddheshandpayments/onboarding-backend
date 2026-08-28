@@ -44,33 +44,29 @@ export class OnboardingsController {
     return this.onboardingsService.provisionCompanyEmail(id, dto, actor.id);
   }
 
-  // HR/SuperAdmin dashboard: every onboarding, company-wide. Basic
-  // equality filters only for now — Step 32 (Day 5) adds the shared
-  // allow-listed filter/sort/pagination machinery across list
-  // endpoints; this doesn't try to anticipate that.
+  // HR/SuperAdmin dashboard: every onboarding, company-wide. Step 32:
+  // allow-listed filters (department/status/health/dateFrom/dateTo)
+  // and sort (name/startDate/progress) — @Query() with no key captures
+  // the FULL query object so the service can reject any key outside
+  // that list, not just read the ones it recognizes.
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('superadmin_hr')
   @Get()
-  listAll(
-    @Query('departmentId') departmentId?: string,
-    @Query('status') status?: string,
-  ) {
-    return this.onboardingsService.listAllOnboardings({ departmentId, status });
+  listAll(@Query() query: Record<string, string | undefined>) {
+    return this.onboardingsService.listAllOnboardings(query);
   }
 
-  // Step 28: CSV export. Same optional filters as listAll(). Notes are
-  // structurally absent from this query (OnboardingsService.
-  // exportOnboardingsCsv never joins that table) — not filtered out.
+  // Step 28: CSV export, same allow-listed filters as listAll() minus
+  // sort (Step 32). Notes are structurally absent from this query
+  // (OnboardingsService.exportOnboardingsCsv never joins that table) —
+  // not filtered out.
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('superadmin_hr')
   @Header('Content-Type', 'text/csv')
   @Header('Content-Disposition', 'attachment; filename="onboardings-export.csv"')
   @Get('export')
-  export(
-    @Query('departmentId') departmentId?: string,
-    @Query('status') status?: string,
-  ) {
-    return this.onboardingsService.exportOnboardingsCsv({ departmentId, status });
+  export(@Query() query: Record<string, string | undefined>) {
+    return this.onboardingsService.exportOnboardingsCsv(query);
   }
 
   // Step 26: the single-screen "what's stuck" view (BRD M6). One row
@@ -78,12 +74,13 @@ export class OnboardingsController {
   // shared isOverdueSql(), which excludes locked tasks so a checkpoint
   // waiting on confirmation shows up once, not as a flood of its
   // blocked-behind-it phase-2 tasks) on an onboarding that isn't
-  // finished yet.
+  // finished yet. Step 32: allow-listed department/owner/priority
+  // filters, dueDate/priority sort.
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('superadmin_hr')
   @Get('stuck')
-  listStuck() {
-    return this.onboardingsService.listStuckTasks();
+  listStuck(@Query() query: Record<string, string | undefined>) {
+    return this.onboardingsService.listStuckTasks(query);
   }
 
   // Step 21: Employee dashboard. Scoped server-side to the caller's
