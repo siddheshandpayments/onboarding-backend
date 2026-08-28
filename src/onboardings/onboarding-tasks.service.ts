@@ -35,57 +35,75 @@ export interface OnboardingTaskRow {
 }
 
 /**
- * Step 16 scope only: the dual-confirmation handover on the checkpoint
- * task specifically (completion_mode 'dual' tasks in general, and the
- * employee-only/owner-only modes for regular tasks, are Step 18).
+ * Step 18 generalizes Step 16's checkpoint-only dual confirmation to
+ * all three completion_mode values, for any task:
+ *   - 'employee': the employee alone closes it, one action.
+ *   - 'owner':    a user matching the task's owner_role alone closes
+ *                 it, one action.
+ *   - 'dual':     both sides must confirm independently — same
+ *                 mechanism the checkpoint already used in Step 16/17,
+ *                 now available to any task marked 'dual', not just
+ *                 is_checkpoint ones.
  *
- * There's no per-task owner assignment mechanism yet (onboarding_tasks
- * .owner_user_id is left NULL at instantiation — see OnboardingsService),
- * so "the owner side" is authorized by role match against the task's
- * owner_role rather than a specific assigned individual. The employee
- * side is unambiguous — there's exactly one employee per onboarding —
- * so that check is a strict identity match, not a role match.
+ * The two endpoints stay "which side is confirming", not "which mode
+ * is this" — the caller doesn't need to know a task's completion_mode
+ * up front; the service figures out from completion_mode whether their
+ * confirmation alone finishes the task (employee/owner) or needs to
+ * wait on the other side (dual).
+ *
+ * There's still no per-task owner assignment mechanism (owner_user_id
+ * stays NULL at instantiation — see OnboardingsService), so "the owner
+ * side" is authorized by role match against owner_role, same as Step
+ * 16. The employee side is a strict identity match against the
+ * onboarding's user_id.
  */
 @Injectable()
 export class OnboardingTasksService {
   constructor(private readonly db: DatabaseService) {}
 
-  async confirmOwnerIssued(taskId: string, actor: AuthenticatedUser) {
-    const task = await this.getCheckpointTaskOrThrow(taskId);
+  async completeAsOwner(taskId: string, actor: AuthenticatedUser) {
+    const task = await this.getActionableTaskOrThrow(taskId);
 
+    if (task.completion_mode === 'employee') {
+      throw new BadRequestException('This task does not take an owner confirmation');
+    }
     if (actor.role !== task.owner_role) {
-      throw new ForbiddenException(
-        `Only a ${task.owner_role} can confirm this side of the handover`,
-      );
+      throw new ForbiddenException(`Only a ${task.owner_role} can complete this task`);
     }
     if (task.owner_confirmed_at) {
       throw new ConflictException('Already confirmed by the owner side');
     }
 
-    return this.applyConfirmation(taskId, 'owner_confirmed_by', 'owner_confirmed_at', 'employee_confirmed_at', actor.id);
+    if (task.completion_mode === 'owner') {
+      return this.completeSingleSided(taskId, 'owner_confirmed_by', 'owner_confirmed_at', actor.id);
+    }
+    return this.applyDualConfirmation(taskId, 'owner_confirmed_by', 'owner_confirmed_at', 'employee_confirmed_at', actor.id);
   }
 
-  async confirmEmployeeReceived(taskId: string, actor: AuthenticatedUser) {
-    const task = await this.getCheckpointTaskOrThrow(taskId);
+  async completeAsEmployee(taskId: string, actor: AuthenticatedUser) {
+    const task = await this.getActionableTaskOrThrow(taskId);
 
-    const { rows } = await this.db.query<{ user_id: string }>(
-      `SELECT user_id FROM onboardings WHERE id = $1`,
-      [task.onboarding_id],
-    );
-    const onboarding = rows[0];
-    if (!onboarding || onboarding.user_id !== actor.id) {
+    if (task.completion_mode === 'owner') {
+      throw new BadRequestException('This task does not take an employee confirmation');
+    }
+
+    const onboarding = await this.getOnboardingOrThrow(task.onboarding_id);
+    if (onboarding.user_id !== actor.id) {
       throw new ForbiddenException(
-        'Only the employee on this onboarding can confirm receipt',
+        'Only the employee on this onboarding can complete this task',
       );
     }
     if (task.employee_confirmed_at) {
       throw new ConflictException('Already confirmed by the employee');
     }
 
-    return this.applyConfirmation(taskId, 'employee_confirmed_by', 'employee_confirmed_at', 'owner_confirmed_at', actor.id);
+    if (task.completion_mode === 'employee') {
+      return this.completeSingleSided(taskId, 'employee_confirmed_by', 'employee_confirmed_at', actor.id);
+    }
+    return this.applyDualConfirmation(taskId, 'employee_confirmed_by', 'employee_confirmed_at', 'owner_confirmed_at', actor.id);
   }
 
-  private async getCheckpointTaskOrThrow(taskId: string): Promise<OnboardingTaskRow> {
+  private async getActionableTaskOrThrow(taskId: string): Promise<OnboardingTaskRow> {
     const { rows } = await this.db.query<OnboardingTaskRow>(
       `SELECT * FROM onboarding_tasks WHERE id = $1`,
       [taskId],
@@ -94,34 +112,76 @@ export class OnboardingTasksService {
     if (!task) {
       throw new NotFoundException('Task not found');
     }
-    if (!task.is_checkpoint || task.completion_mode !== 'dual') {
-      throw new BadRequestException(
-        'This endpoint only applies to the checkpoint handover task',
+    if (task.status === 'locked') {
+      throw new ForbiddenException(
+        'This task is locked until the checkpoint is completed',
       );
     }
     if (task.status === 'cancelled') {
       throw new ConflictException('This task has been cancelled');
     }
+    if (task.status === 'completed') {
+      throw new ConflictException('This task is already completed');
+    }
     return task;
   }
 
+  private async getOnboardingOrThrow(onboardingId: string): Promise<{ user_id: string }> {
+    const { rows } = await this.db.query<{ user_id: string }>(
+      `SELECT user_id FROM onboardings WHERE id = $1`,
+      [onboardingId],
+    );
+    const onboarding = rows[0];
+    if (!onboarding) {
+      throw new NotFoundException('Onboarding not found');
+    }
+    return onboarding;
+  }
+
+  /** employee-only / owner-only: one action closes the task outright —
+   *  no other side to wait on. The confirmation column is still
+   *  recorded (who/when), it just isn't gating anything. */
+  private async completeSingleSided(
+    taskId: string,
+    confirmedByColumn: 'owner_confirmed_by' | 'employee_confirmed_by',
+    confirmedAtColumn: 'owner_confirmed_at' | 'employee_confirmed_at',
+    actorId: string,
+  ): Promise<OnboardingTaskRow> {
+    const { rows } = await this.db.query<OnboardingTaskRow>(
+      `UPDATE onboarding_tasks
+       SET ${confirmedByColumn} = $2,
+           ${confirmedAtColumn} = now(),
+           status = 'completed',
+           completed_at = now()
+       WHERE id = $1 AND ${confirmedAtColumn} IS NULL AND status NOT IN ('cancelled', 'completed')
+       RETURNING *`,
+      [taskId, actorId],
+    );
+
+    if (!rows[0]) {
+      throw new ConflictException('Already completed');
+    }
+    return rows[0];
+  }
+
   /**
-   * One atomic UPDATE, not read-then-write: the CASE expressions read
-   * the *other* side's confirmation column as of this statement's own
-   * row lock, so two confirmations arriving concurrently still
-   * serialize correctly — whichever commits second is the one that
-   * sees the first's value and flips status to 'completed'. The
+   * dual: one atomic UPDATE, not read-then-write — the CASE expressions
+   * read the *other* side's confirmation column as of this statement's
+   * own row lock, so two confirmations arriving concurrently still
+   * serialize correctly (whichever commits second is the one that sees
+   * the first's value and flips status to 'completed'). The
    * `<column> IS NULL` guard in WHERE makes a double-confirmation from
    * the same side a no-op (0 rows) rather than silently overwriting
    * who confirmed it.
    *
-   * When this confirmation is the one that completes the checkpoint
-   * (Step 17), two more things happen in the same transaction: every
-   * other 'locked' task on this onboarding flips to 'pending' — that's
-   * the actual "phase-2 gate" — and the onboarding itself advances to
-   * 'active'.
+   * When this confirmation is the one that completes the CHECKPOINT
+   * specifically (is_checkpoint, not just any dual task — Step 17),
+   * two more things happen in the same transaction: every other
+   * 'locked' task on this onboarding flips to 'pending', and the
+   * onboarding itself advances to 'active'. A regular dual-mode task
+   * (is_checkpoint = false) completing does neither — it's just a task.
    */
-  private async applyConfirmation(
+  private async applyDualConfirmation(
     taskId: string,
     confirmedByColumn: 'owner_confirmed_by' | 'employee_confirmed_by',
     confirmedAtColumn: 'owner_confirmed_at' | 'employee_confirmed_at',
@@ -135,7 +195,7 @@ export class OnboardingTasksService {
              ${confirmedAtColumn} = now(),
              status = CASE WHEN ${otherConfirmedAtColumn} IS NOT NULL THEN 'completed' ELSE status END,
              completed_at = CASE WHEN ${otherConfirmedAtColumn} IS NOT NULL THEN now() ELSE completed_at END
-         WHERE id = $1 AND ${confirmedAtColumn} IS NULL AND status <> 'cancelled'
+         WHERE id = $1 AND ${confirmedAtColumn} IS NULL AND status NOT IN ('cancelled', 'completed')
          RETURNING *`,
         [taskId, actorId],
       );
@@ -145,7 +205,7 @@ export class OnboardingTasksService {
         throw new ConflictException('Already confirmed from this side');
       }
 
-      if (task.status === 'completed') {
+      if (task.status === 'completed' && task.is_checkpoint) {
         await this.unlockPhaseTwoTasks(client, task.onboarding_id);
         await this.activateOnboarding(client, task.onboarding_id);
       }
@@ -167,12 +227,11 @@ export class OnboardingTasksService {
     );
   }
 
-  /** Third and final onboarding.status transition. Guarded on an
-   *  IN-list of every pre-active status rather than exactly
-   *  'checkpoint_pending' — the same reasoning as AuthService's
-   *  checkpoint_pending flip: HR/IT/the employee are independent
-   *  actors, so the checkpoint can realistically be confirmed before
-   *  the company email dance is finished. This only ever moves status
+  /** Third and final onboarding.status transition (Step 17). Guarded
+   *  on an IN-list of every pre-active status rather than exactly
+   *  'checkpoint_pending' — HR/IT/the employee are independent actors,
+   *  so the checkpoint can realistically be confirmed before the
+   *  company email dance is finished. This only ever moves status
    *  forward, and is a no-op if the onboarding is already active or
    *  beyond. */
   private async activateOnboarding(client: PoolClient, onboardingId: string) {
