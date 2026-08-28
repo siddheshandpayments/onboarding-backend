@@ -8,6 +8,7 @@ import {
 import { PoolClient } from 'pg';
 import { DatabaseService } from '../database/database.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+import { isOverdueSql } from './utils/overdue.util';
 
 export interface OnboardingTaskRow {
   id: string;
@@ -156,13 +157,15 @@ export class OnboardingTasksService {
   /** Step 20: the TaskOwner dashboard. Scoped server-side to
    *  owner_user_id = actor.id — not a role filter, not a client-
    *  supplied id — so a task_owner only ever sees tasks they've
-   *  personally claimed, across every onboarding. */
+   *  personally claimed, across every onboarding. is_overdue (Step 25)
+   *  uses the same shared definition as the HR and Employee dashboards. */
   async listMyTasks(actor: AuthenticatedUser) {
     const { rows } = await this.db.query(
       `SELECT
          ot.id, ot.onboarding_id, ot.title, ot.description, ot.due_date,
          ot.priority, ot.status, ot.completion_mode, ot.is_checkpoint,
          ot.blocked_reason,
+         ${isOverdueSql('ot.')} AS is_overdue,
          u.full_name AS employee_name,
          d.name AS department_name
        FROM onboarding_tasks ot

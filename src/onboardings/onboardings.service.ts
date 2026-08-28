@@ -11,6 +11,7 @@ import { TemplatesService } from '../templates/templates.service';
 import { CreateOnboardingDto } from './dto/create-onboarding.dto';
 import { ProvisionCompanyEmailDto } from './dto/provision-company-email.dto';
 import { computeDueDate } from './utils/due-date.util';
+import { isOverdueSql } from './utils/overdue.util';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 
 /** Same structural-typing trick as TemplatesService — lets the read
@@ -239,10 +240,9 @@ export class OnboardingsService {
   /**
    * "What's stuck": one row per required, not-yet-done task that is
    * either explicitly blocked or already past its due date, on an
-   * onboarding that hasn't finished. Overdue is computed inline here
-   * (due_date < CURRENT_DATE, not completed/cancelled) rather than
-   * stored — Step 25 formalizes this same condition as its own
-   * reusable check; this doesn't wait on that to be useful now.
+   * onboarding that hasn't finished. Overdue (Step 25) is
+   * isOverdueSql('ot.') — the same definition every other dashboard
+   * uses, not a locally re-typed condition.
    */
   async listStuckTasks() {
     const { rows } = await this.db.query(
@@ -256,7 +256,7 @@ export class OnboardingsService {
          ot.status AS task_status,
          ot.blocked_reason,
          (ot.status = 'blocked') AS is_blocked,
-         (ot.due_date < CURRENT_DATE AND ot.status NOT IN ('completed', 'cancelled')) AS is_overdue
+         ${isOverdueSql('ot.')} AS is_overdue
        FROM onboarding_tasks ot
        JOIN onboardings o ON o.id = ot.onboarding_id
        JOIN users u ON u.id = o.user_id
@@ -264,7 +264,7 @@ export class OnboardingsService {
        WHERE o.status NOT IN ('completed', 'cancelled')
          AND ot.is_required = true
          AND ot.status NOT IN ('completed', 'cancelled')
-         AND (ot.status = 'blocked' OR ot.due_date < CURRENT_DATE)
+         AND (ot.status = 'blocked' OR ${isOverdueSql('ot.')})
        ORDER BY ot.due_date`,
     );
     return rows;
@@ -304,6 +304,7 @@ export class OnboardingsService {
       status: string;
       blocked_reason: string | null;
       bucket: 'overdue' | 'today' | 'upcoming';
+      is_overdue: boolean;
     }>(
       `SELECT
          id, title, description, owner_role, due_date, priority, is_required,
@@ -312,7 +313,8 @@ export class OnboardingsService {
            WHEN due_date < CURRENT_DATE THEN 'overdue'
            WHEN due_date = CURRENT_DATE THEN 'today'
            ELSE 'upcoming'
-         END AS bucket
+         END AS bucket,
+         ${isOverdueSql()} AS is_overdue
        FROM onboarding_tasks
        WHERE onboarding_id = $1
          AND status NOT IN ('locked', 'completed', 'cancelled')
