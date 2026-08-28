@@ -144,6 +144,19 @@ export class OnboardingsService {
     );
   }
 
+  /** Used by ClaimedAccountGuard (KnowledgeModule) to check the caller's
+   *  own checkpoint status and department — never a client-supplied
+   *  value. Returns null for accounts with no onboarding at all
+   *  (task_owner/superadmin_hr), which callers should treat as
+   *  ineligible for anything onboarding-status-gated. */
+  async findByUserId(userId: string): Promise<OnboardingRow | null> {
+    const { rows } = await this.db.query<OnboardingRow>(
+      `SELECT * FROM onboardings WHERE user_id = $1`,
+      [userId],
+    );
+    return rows[0] ?? null;
+  }
+
   private async toOnboardingWithTasks(queryable: Queryable, onboardingId: string) {
     const { rows: onboardingRows } = await queryable.query<OnboardingRow>(
       `SELECT * FROM onboardings WHERE id = $1`,
