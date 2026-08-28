@@ -1,11 +1,24 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { CommunityService } from './community.service';
 import { CreatePostDto } from './dto/create-post.dto';
 import { CreateCommentDto } from './dto/create-comment.dto';
 import { CastVoteDto } from './dto/cast-vote.dto';
+import { DeletePostDto } from './dto/delete-post.dto';
 
 // No @Roles() anywhere here — community is open to every authenticated
 // role (employees, task owners, HR/SuperAdmin all share the same
@@ -52,5 +65,21 @@ export class CommunityController {
     @Body() dto: CastVoteDto,
   ) {
     return this.communityService.castVote(id, actor.id, dto.value);
+  }
+
+  // Step 30: SuperAdmin/HR only, unlike every other route on this
+  // controller. Acts purely on the post id — CommunityService.
+  // deletePost never reads or reveals who wrote it, even to the admin
+  // performing the moderation.
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('superadmin_hr')
+  @Delete(':id')
+  @HttpCode(204)
+  async deletePost(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: DeletePostDto,
+  ) {
+    await this.communityService.deletePost(id, actor.id, dto.reason);
   }
 }

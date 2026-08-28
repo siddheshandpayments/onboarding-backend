@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 
 export interface CommunityPostRow {
   id: string;
@@ -44,15 +45,20 @@ export interface CommunityCommentRow {
  * live via COUNT/SUM against community_votes/community_comments, never
  * stored columns — same rule as onboarding progress.
  *
- * Deliberately NOT wired into ActivityLogService: logging author_id
- * against a post/comment/vote would let SuperAdmin/HR deanonymize
- * authorship via the audit trail, which defeats the entire point of
- * hiding it in the API. Community content gets no activity log entries
- * at all.
+ * Nothing that touches author_id is wired into ActivityLogService:
+ * logging it against a post/comment/vote would let SuperAdmin/HR
+ * deanonymize authorship via the audit trail, which defeats the entire
+ * point of hiding it in the API. Step 30's deletePost() is the one
+ * exception — its actor is the moderating admin (never anonymous to
+ * begin with) acting on a post id, and it never reads or logs who
+ * originally wrote the post.
  */
 @Injectable()
 export class CommunityService {
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly activityLog: ActivityLogService,
+  ) {}
 
   async createPost(actorId: string, body: string): Promise<CommunityPostRow> {
     const { rows } = await this.db.query<{ id: string }>(
@@ -141,6 +147,40 @@ export class CommunityService {
     );
 
     return this.getPostOrThrow(postId, actorId);
+  }
+
+  /**
+   * Step 30: SuperAdmin soft-delete-with-reason. This UPDATE is scoped
+   * entirely by post id — it never SELECTs, returns, or logs
+   * author_id, so the admin performing this moderation action never
+   * learns who wrote the post they're removing. deleted_by records the
+   * MODERATOR's own id (never anonymous — they're acting in their own
+   * name), which is a completely different thing from the author's
+   * identity and doesn't touch it.
+   *
+   * Once deleted_at is set, every read path (listPosts,
+   * getPostWithComments, assertPostExists) already filters
+   * `deleted_at IS NULL`, so the post and its comment thread simply
+   * stop being reachable — no separate cascade needed.
+   */
+  async deletePost(postId: string, actorId: string, reason: string): Promise<void> {
+    const { rowCount } = await this.db.query(
+      `UPDATE community_posts
+       SET deleted_at = now(), deleted_by = $2, delete_reason = $3
+       WHERE id = $1 AND deleted_at IS NULL`,
+      [postId, actorId, reason],
+    );
+    if (!rowCount) {
+      throw new NotFoundException('Post not found');
+    }
+
+    await this.activityLog.log({
+      actorId,
+      action: 'community_post.deleted',
+      entityType: 'community_post',
+      entityId: postId,
+      metadata: { reason },
+    });
   }
 
   private async assertPostExists(postId: string): Promise<void> {
