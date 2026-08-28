@@ -196,6 +196,79 @@ export class OnboardingsService {
     });
   }
 
+  /**
+   * SuperAdmin/HR dashboard: every onboarding, company-wide, with
+   * enough joined context (employee/department/template names, a live
+   * required-task progress count) to actually be a dashboard row
+   * rather than a bare foreign-key dump. Progress is two plain COUNT
+   * subqueries against onboarding_tasks, never a stored column — same
+   * "computed live, no drift possible" rule as everywhere else.
+   *
+   * Filters are optional equality only (`$n::type IS NULL OR ...`),
+   * bound as query parameters rather than string-built — no dynamic
+   * SQL. Neither departmentId nor status is validated against an
+   * allow-list yet; an unknown status just yields zero rows. Step 32
+   * generalizes this properly across every list endpoint.
+   */
+  async listAllOnboardings(filters: { departmentId?: string; status?: string }) {
+    const { rows } = await this.db.query(
+      `SELECT
+         o.id, o.user_id, o.department_id, o.template_id, o.template_version,
+         o.start_date, o.status, o.created_at, o.updated_at,
+         u.full_name AS employee_name,
+         d.name AS department_name,
+         t.name AS template_name,
+         (SELECT COUNT(*) FROM onboarding_tasks ot
+            WHERE ot.onboarding_id = o.id AND ot.is_required = true) AS required_task_count,
+         (SELECT COUNT(*) FROM onboarding_tasks ot
+            WHERE ot.onboarding_id = o.id AND ot.is_required = true
+              AND ot.status = 'completed') AS required_task_completed_count
+       FROM onboardings o
+       JOIN users u ON u.id = o.user_id
+       JOIN departments d ON d.id = o.department_id
+       JOIN onboarding_templates t ON t.id = o.template_id
+       WHERE ($1::uuid IS NULL OR o.department_id = $1)
+         AND ($2::text IS NULL OR o.status = $2)
+       ORDER BY o.created_at DESC`,
+      [filters.departmentId ?? null, filters.status ?? null],
+    );
+    return rows;
+  }
+
+  /**
+   * "What's stuck": one row per required, not-yet-done task that is
+   * either explicitly blocked or already past its due date, on an
+   * onboarding that hasn't finished. Overdue is computed inline here
+   * (due_date < CURRENT_DATE, not completed/cancelled) rather than
+   * stored — Step 25 formalizes this same condition as its own
+   * reusable check; this doesn't wait on that to be useful now.
+   */
+  async listStuckTasks() {
+    const { rows } = await this.db.query(
+      `SELECT
+         o.id AS onboarding_id,
+         u.full_name AS employee_name,
+         d.name AS department_name,
+         ot.id AS task_id,
+         ot.title AS task_title,
+         ot.due_date,
+         ot.status AS task_status,
+         ot.blocked_reason,
+         (ot.status = 'blocked') AS is_blocked,
+         (ot.due_date < CURRENT_DATE AND ot.status NOT IN ('completed', 'cancelled')) AS is_overdue
+       FROM onboarding_tasks ot
+       JOIN onboardings o ON o.id = ot.onboarding_id
+       JOIN users u ON u.id = o.user_id
+       JOIN departments d ON d.id = o.department_id
+       WHERE o.status NOT IN ('completed', 'cancelled')
+         AND ot.is_required = true
+         AND ot.status NOT IN ('completed', 'cancelled')
+         AND (ot.status = 'blocked' OR ot.due_date < CURRENT_DATE)
+       ORDER BY ot.due_date`,
+    );
+    return rows;
+  }
+
   /** Used by ClaimedAccountGuard (KnowledgeModule) to check the caller's
    *  own checkpoint status and department — never a client-supplied
    *  value. Returns null for accounts with no onboarding at all
