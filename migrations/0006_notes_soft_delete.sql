@@ -1,0 +1,12 @@
+-- 0006: notes needs a deleted_at column like every other hard-
+-- deletable table — the "nothing ever hard-deleted" rule (Step 2)
+-- applies here too, and it was missed in the original 0002 schema.
+--
+-- No reason column, unlike community_posts.delete_reason or
+-- onboarding_tasks.cancel_reason: those record an ADMIN's reason for
+-- acting on someone else's content. A note's deleted_at is just its
+-- owner quietly clearing their own private scratchpad — nobody else
+-- will ever see it either way (Step 23), so there's nothing for a
+-- reason to explain to anyone. Same bare-deleted_at precedent as
+-- users.deleted_at.
+ALTER TABLE notes ADD COLUMN deleted_at TIMESTAMPTZ;

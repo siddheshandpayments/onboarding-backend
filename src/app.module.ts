@@ -7,6 +7,7 @@ import { AuthModule } from './auth/auth.module';
 import { OnboardingsModule } from './onboardings/onboardings.module';
 import { KnowledgeModule } from './knowledge/knowledge.module';
 import { EntitlementsModule } from './entitlements/entitlements.module';
+import { NotesModule } from './notes/notes.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { EntitlementsModule } from './entitlements/entitlements.module';
     OnboardingsModule,
     KnowledgeModule,
     EntitlementsModule,
+    NotesModule,
     // Remaining feature modules get added here as later steps build them.
   ],
 })
