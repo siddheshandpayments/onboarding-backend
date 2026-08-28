@@ -10,6 +10,7 @@ import { EntitlementsModule } from './entitlements/entitlements.module';
 import { NotesModule } from './notes/notes.module';
 import { ActivityLogModule } from './activity-log/activity-log.module';
 import { CommunityModule } from './community/community.module';
+import { DocumentsModule } from './documents/documents.module';
 
 @Module({
   imports: [
@@ -29,6 +30,7 @@ import { CommunityModule } from './community/community.module';
     EntitlementsModule,
     NotesModule,
     CommunityModule,
+    DocumentsModule,
     // Remaining feature modules get added here as later steps build them.
   ],
 })
