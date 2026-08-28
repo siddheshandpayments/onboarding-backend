@@ -8,6 +8,7 @@ import {
 import { DatabaseService } from '../database/database.service';
 import { UsersService } from '../users/users.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateEntitlementDto } from './dto/create-entitlement.dto';
 
 export interface EntitlementRow {
@@ -38,9 +39,10 @@ export class EntitlementsService {
   constructor(
     private readonly db: DatabaseService,
     private readonly usersService: UsersService,
+    private readonly activityLog: ActivityLogService,
   ) {}
 
-  async createEntitlement(dto: CreateEntitlementDto) {
+  async createEntitlement(dto: CreateEntitlementDto, actorId: string) {
     if (dto.scope === 'department' && !dto.departmentId) {
       throw new BadRequestException(
         'departmentId is required when scope is "department"',
@@ -60,7 +62,17 @@ export class EntitlementsService {
        RETURNING *`,
       [dto.name, dto.scope, dto.departmentId ?? null, dto.totalQuantity ?? null],
     );
-    return rows[0];
+    const entitlement = rows[0];
+
+    await this.activityLog.log({
+      actorId,
+      action: 'entitlement.created',
+      entityType: 'entitlement',
+      entityId: entitlement.id,
+      metadata: { name: dto.name, scope: dto.scope, totalQuantity: dto.totalQuantity ?? null },
+    });
+
+    return entitlement;
   }
 
   /** What the caller could claim: active entitlements that are either
@@ -139,6 +151,17 @@ export class EntitlementsService {
            RETURNING *`,
           [entitlementId, actor.id],
         );
+
+        await this.activityLog.log(
+          {
+            actorId: actor.id,
+            action: 'entitlement.claimed',
+            entityType: 'entitlement',
+            entityId: entitlementId,
+          },
+          client,
+        );
+
         return assignmentRows[0];
       } catch (err: any) {
         if (err?.code === UNIQUE_VIOLATION) {

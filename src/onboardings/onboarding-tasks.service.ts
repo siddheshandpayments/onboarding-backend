@@ -8,6 +8,7 @@ import {
 import { PoolClient } from 'pg';
 import { DatabaseService } from '../database/database.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { isOverdueSql } from './utils/overdue.util';
 
 export interface OnboardingTaskRow {
@@ -68,7 +69,10 @@ export interface OnboardingTaskRow {
  */
 @Injectable()
 export class OnboardingTasksService {
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly activityLog: ActivityLogService,
+  ) {}
 
   async completeAsOwner(taskId: string, actor: AuthenticatedUser) {
     const task = await this.getActionableTaskOrThrow(taskId);
@@ -90,9 +94,22 @@ export class OnboardingTasksService {
     }
 
     if (task.completion_mode === 'owner') {
-      return this.completeSingleSided(taskId, 'owner_confirmed_by', 'owner_confirmed_at', actor.id);
+      return this.completeSingleSided(
+        taskId,
+        'owner_confirmed_by',
+        'owner_confirmed_at',
+        actor.id,
+        'onboarding_task.owner_completed',
+      );
     }
-    return this.applyDualConfirmation(taskId, 'owner_confirmed_by', 'owner_confirmed_at', 'employee_confirmed_at', actor.id);
+    return this.applyDualConfirmation(
+      taskId,
+      'owner_confirmed_by',
+      'owner_confirmed_at',
+      'employee_confirmed_at',
+      actor.id,
+      'onboarding_task.owner_confirmed',
+    );
   }
 
   async completeAsEmployee(taskId: string, actor: AuthenticatedUser) {
@@ -113,9 +130,22 @@ export class OnboardingTasksService {
     }
 
     if (task.completion_mode === 'employee') {
-      return this.completeSingleSided(taskId, 'employee_confirmed_by', 'employee_confirmed_at', actor.id);
+      return this.completeSingleSided(
+        taskId,
+        'employee_confirmed_by',
+        'employee_confirmed_at',
+        actor.id,
+        'onboarding_task.employee_completed',
+      );
     }
-    return this.applyDualConfirmation(taskId, 'employee_confirmed_by', 'employee_confirmed_at', 'owner_confirmed_at', actor.id);
+    return this.applyDualConfirmation(
+      taskId,
+      'employee_confirmed_by',
+      'employee_confirmed_at',
+      'owner_confirmed_at',
+      actor.id,
+      'onboarding_task.employee_confirmed',
+    );
   }
 
   /**
@@ -151,6 +181,14 @@ export class OnboardingTasksService {
     if (!rows[0]) {
       throw new ConflictException('This task has already been claimed');
     }
+
+    await this.activityLog.log({
+      actorId: actor.id,
+      action: 'onboarding_task.claimed',
+      entityType: 'onboarding_task',
+      entityId: taskId,
+    });
+
     return rows[0];
   }
 
@@ -222,6 +260,7 @@ export class OnboardingTasksService {
     confirmedByColumn: 'owner_confirmed_by' | 'employee_confirmed_by',
     confirmedAtColumn: 'owner_confirmed_at' | 'employee_confirmed_at',
     actorId: string,
+    action: string,
   ): Promise<OnboardingTaskRow> {
     const { rows } = await this.db.query<OnboardingTaskRow>(
       `UPDATE onboarding_tasks
@@ -237,6 +276,14 @@ export class OnboardingTasksService {
     if (!rows[0]) {
       throw new ConflictException('Already completed');
     }
+
+    await this.activityLog.log({
+      actorId,
+      action,
+      entityType: 'onboarding_task',
+      entityId: taskId,
+    });
+
     return rows[0];
   }
 
@@ -263,6 +310,7 @@ export class OnboardingTasksService {
     confirmedAtColumn: 'owner_confirmed_at' | 'employee_confirmed_at',
     otherConfirmedAtColumn: 'owner_confirmed_at' | 'employee_confirmed_at',
     actorId: string,
+    action: string,
   ): Promise<OnboardingTaskRow> {
     return this.db.transaction(async (client) => {
       const { rows } = await client.query<OnboardingTaskRow>(
@@ -280,6 +328,17 @@ export class OnboardingTasksService {
       if (!task) {
         throw new ConflictException('Already confirmed from this side');
       }
+
+      await this.activityLog.log(
+        {
+          actorId,
+          action,
+          entityType: 'onboarding_task',
+          entityId: taskId,
+          metadata: { completedThisConfirmation: task.status === 'completed' },
+        },
+        client,
+      );
 
       if (task.status === 'completed' && task.is_checkpoint) {
         await this.unlockPhaseTwoTasks(client, task.onboarding_id);

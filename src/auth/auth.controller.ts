@@ -7,6 +7,8 @@ import { RefreshGuard } from './guards/refresh.guard';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { RolesGuard } from './guards/roles.guard';
 import { Roles } from './decorators/roles.decorator';
+import { CurrentUser } from './decorators/current-user.decorator';
+import { AuthenticatedUser } from './strategies/jwt.strategy';
 import { PreAuthUser, PreAuthContext } from './decorators/pre-auth-user.decorator';
 import { RefreshUser } from './decorators/refresh-user.decorator';
 
@@ -17,15 +19,18 @@ export class AuthController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('superadmin_hr')
   @Post('users')
-  createUser(@Body() dto: CreateUserDto) {
-    return this.authService.createUser(dto);
+  createUser(@CurrentUser() actor: AuthenticatedUser, @Body() dto: CreateUserDto) {
+    return this.authService.createUser(dto, actor.id);
   }
 
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('superadmin_hr')
   @Post('users/:id/regenerate-credentials')
-  regenerateCredentials(@Param('id', ParseUUIDPipe) id: string) {
-    return this.authService.regenerateCredentials(id);
+  regenerateCredentials(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    return this.authService.regenerateCredentials(id, actor.id);
   }
 
   // --- Login flow ---

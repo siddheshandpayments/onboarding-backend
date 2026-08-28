@@ -1,12 +1,15 @@
 import { Module } from '@nestjs/common';
+
 import { AuthModule } from '../auth/auth.module';
+import { ActivityLogModule } from '../activity-log/activity-log.module';
+
 import { TemplatesController } from './templates.controller';
 import { TemplatesService } from './templates.service';
 
 @Module({
-  imports: [AuthModule], // for JwtAuthGuard/RolesGuard on the controller
+  imports: [AuthModule, ActivityLogModule],
   controllers: [TemplatesController],
   providers: [TemplatesService],
-  exports: [TemplatesService], // OnboardingsModule (step 12) needs this for instantiation
+  exports: [TemplatesService],
 })
 export class TemplatesModule {}

@@ -8,6 +8,7 @@ import { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { DatabaseService } from '../database/database.service';
 import { UsersService } from '../users/users.service';
 import { TemplatesService } from '../templates/templates.service';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateOnboardingDto } from './dto/create-onboarding.dto';
 import { ProvisionCompanyEmailDto } from './dto/provision-company-email.dto';
 import { computeDueDate } from './utils/due-date.util';
@@ -45,6 +46,7 @@ export class OnboardingsService {
     private readonly db: DatabaseService,
     private readonly usersService: UsersService,
     private readonly templatesService: TemplatesService,
+    private readonly activityLog: ActivityLogService,
   ) {}
 
   /**
@@ -54,7 +56,7 @@ export class OnboardingsService {
    * template versioning is what makes that safe; a later template
    * edit publishes a new version and never touches these rows.
    */
-  async createOnboarding(dto: CreateOnboardingDto) {
+  async createOnboarding(dto: CreateOnboardingDto, actorId: string) {
     const user = await this.usersService.findById(dto.userId);
     if (!user) {
       throw new NotFoundException('User not found');
@@ -88,6 +90,17 @@ export class OnboardingsService {
         for (const task of template.tasks) {
           await this.insertOnboardingTask(client, onboarding.id, task, startDate);
         }
+
+        await this.activityLog.log(
+          {
+            actorId,
+            action: 'onboarding.created',
+            entityType: 'onboarding',
+            entityId: onboarding.id,
+            metadata: { userId: user.id, departmentId: user.department_id, templateId: template.id },
+          },
+          client,
+        );
 
         return this.toOnboardingWithTasks(client, onboarding.id);
       });
@@ -160,7 +173,11 @@ export class OnboardingsService {
    * company email for an onboarding that's already past this point
    * would be a mistake worth surfacing, not silently absorbing.
    */
-  async provisionCompanyEmail(onboardingId: string, dto: ProvisionCompanyEmailDto) {
+  async provisionCompanyEmail(
+    onboardingId: string,
+    dto: ProvisionCompanyEmailDto,
+    actorId: string,
+  ) {
     const { rows } = await this.db.query<OnboardingRow>(
       `SELECT * FROM onboardings WHERE id = $1`,
       [onboardingId],
@@ -194,6 +211,20 @@ export class OnboardingsService {
           'Onboarding status changed concurrently — company email not provisioned',
         );
       }
+
+      // Never the email address itself in metadata — not a secret like
+      // a password or TOTP secret, but there's no audit need for it
+      // either; entity_id (the onboarding) is enough to find it.
+      await this.activityLog.log(
+        {
+          actorId,
+          action: 'onboarding.email_provisioned',
+          entityType: 'onboarding',
+          entityId: onboardingId,
+        },
+        client,
+      );
+
       return updated;
     });
   }

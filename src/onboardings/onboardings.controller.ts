@@ -17,8 +17,8 @@ export class OnboardingsController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('superadmin_hr')
   @Post()
-  create(@Body() dto: CreateOnboardingDto) {
-    return this.onboardingsService.createOnboarding(dto);
+  create(@CurrentUser() actor: AuthenticatedUser, @Body() dto: CreateOnboardingDto) {
+    return this.onboardingsService.createOnboarding(dto, actor.id);
   }
 
   // Same privilege level: HR recording the company email is what
@@ -27,10 +27,11 @@ export class OnboardingsController {
   @Roles('superadmin_hr')
   @Post(':id/provision-email')
   provisionEmail(
+    @CurrentUser() actor: AuthenticatedUser,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: ProvisionCompanyEmailDto,
   ) {
-    return this.onboardingsService.provisionCompanyEmail(id, dto);
+    return this.onboardingsService.provisionCompanyEmail(id, dto, actor.id);
   }
 
   // HR/SuperAdmin dashboard: every onboarding, company-wide. Basic
@@ -47,12 +48,12 @@ export class OnboardingsController {
     return this.onboardingsService.listAllOnboardings({ departmentId, status });
   }
 
-  // "What's stuck": one row per required task that's either blocked or
-  // past due on an onboarding that isn't finished yet. A first pass —
-  // Step 25/26 (Day 4) formalize overdue detection and polish this
-  // into the single-screen view the BRD calls out by name; the overdue
-  // condition here (due_date < today, not completed/cancelled) is
-  // exactly what that step will reuse, just not extracted yet.
+  // Step 26: the single-screen "what's stuck" view (BRD M6). One row
+  // per required task that's either blocked or overdue (Step 25's
+  // shared isOverdueSql(), which excludes locked tasks so a checkpoint
+  // waiting on confirmation shows up once, not as a flood of its
+  // blocked-behind-it phase-2 tasks) on an onboarding that isn't
+  // finished yet.
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('superadmin_hr')
   @Get('stuck')

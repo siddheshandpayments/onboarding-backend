@@ -11,6 +11,8 @@ import {
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { TemplatesService } from './templates.service';
 import { CreateTemplateDto } from './dto/create-template.dto';
 import { NewTemplateVersionDto } from './dto/new-template-version.dto';
@@ -23,18 +25,19 @@ export class TemplatesController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('superadmin_hr')
   @Post()
-  create(@Body() dto: CreateTemplateDto) {
-    return this.templatesService.createTemplate(dto);
+  create(@CurrentUser() actor: AuthenticatedUser, @Body() dto: CreateTemplateDto) {
+    return this.templatesService.createTemplate(dto, actor.id);
   }
 
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('superadmin_hr')
   @Post(':id/versions')
   createNewVersion(
+    @CurrentUser() actor: AuthenticatedUser,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: NewTemplateVersionDto,
   ) {
-    return this.templatesService.createNewVersion(id, dto);
+    return this.templatesService.createNewVersion(id, dto, actor.id);
   }
 
   // Any authenticated role may read templates — JwtAuthGuard only, no @Roles.

@@ -8,6 +8,7 @@ import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import { UsersService, UserRow } from '../users/users.service';
 import { DatabaseService } from '../database/database.service';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { generateLoginEmail, generateTempPassword } from './utils/credential-generator';
 import { generateTotpEnrollment, verifyTotpCode } from './utils/totp';
@@ -45,9 +46,10 @@ export class AuthService {
     // a circular module dependency (OnboardingsModule already imports
     // AuthModule for its guards). See completeCompanyEmailPasswordReset.
     private readonly db: DatabaseService,
+    private readonly activityLog: ActivityLogService,
   ) {}
 
-  async createUser(dto: CreateUserDto) {
+  async createUser(dto: CreateUserDto, actorId: string) {
     const domain = this.config.get<string>('LOGIN_EMAIL_DOMAIN')!;
     const tempPassword = generateTempPassword();
     const passwordHash = await bcrypt.hash(tempPassword, BCRYPT_ROUNDS);
@@ -71,6 +73,17 @@ export class AuthService {
       }
     }
 
+    // Role/department are fine to log — never the temp password or
+    // its hash, which never leave this method except in the one-time
+    // credentials payload below.
+    await this.activityLog.log({
+      actorId,
+      action: 'user.created',
+      entityType: 'user',
+      entityId: user.id,
+      metadata: { role: dto.role, departmentId: dto.departmentId ?? null },
+    });
+
     return {
       user: this.usersService.toPublicUser(user),
       credentials: {
@@ -81,13 +94,20 @@ export class AuthService {
     };
   }
 
-  async regenerateCredentials(userId: string) {
+  async regenerateCredentials(userId: string, actorId: string) {
     const user = await this.usersService.findById(userId);
     if (!user) throw new NotFoundException('User not found');
 
     const tempPassword = generateTempPassword();
     const passwordHash = await bcrypt.hash(tempPassword, BCRYPT_ROUNDS);
     await this.usersService.setPasswordHash(userId, passwordHash); // forceReset defaults true
+
+    await this.activityLog.log({
+      actorId,
+      action: 'user.credentials_regenerated',
+      entityType: 'user',
+      entityId: userId,
+    });
 
     return {
       credentials: {

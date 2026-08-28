@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { DatabaseService } from '../database/database.service';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateTemplateDto } from './dto/create-template.dto';
 import { NewTemplateVersionDto } from './dto/new-template-version.dto';
 import { TemplateTaskInputDto } from './dto/template-task-input.dto';
@@ -44,7 +45,10 @@ export interface TemplateTaskRow {
 
 @Injectable()
 export class TemplatesService {
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly activityLog: ActivityLogService,
+  ) {}
 
   /** Inserts the template_tasks rows for a given template id. Shared by
    *  both "create brand new template" and "publish new version", since
@@ -76,7 +80,7 @@ export class TemplatesService {
     }
   }
 
-  async createTemplate(dto: CreateTemplateDto) {
+  async createTemplate(dto: CreateTemplateDto, actorId: string) {
     return this.db.transaction(async (client) => {
       const { rows } = await client.query<TemplateRow>(
         `INSERT INTO onboarding_templates (department_id, name, version, is_active)
@@ -86,6 +90,16 @@ export class TemplatesService {
       );
       const template = rows[0];
       await this.insertTasks(client, template.id, dto.tasks);
+      await this.activityLog.log(
+        {
+          actorId,
+          action: 'template.created',
+          entityType: 'onboarding_template',
+          entityId: template.id,
+          metadata: { name: dto.name, departmentId: dto.departmentId, version: 1 },
+        },
+        client,
+      );
       return this.toTemplateWithTasks(client, template.id);
     });
   }
@@ -95,7 +109,7 @@ export class TemplatesService {
    *  The old version's rows are never touched — this is what makes an
    *  in-flight onboarding immune to the edit (it snapshot from the old
    *  version's rows and never looks at them again anyway). */
-  async createNewVersion(templateId: string, dto: NewTemplateVersionDto) {
+  async createNewVersion(templateId: string, dto: NewTemplateVersionDto, actorId: string) {
     return this.db.transaction(async (client) => {
       const { rows: currentRows } = await client.query<TemplateRow>(
         `SELECT * FROM onboarding_templates WHERE id = $1`,
@@ -119,6 +133,21 @@ export class TemplatesService {
       );
       const newTemplate = newRows[0];
       await this.insertTasks(client, newTemplate.id, dto.tasks);
+      await this.activityLog.log(
+        {
+          actorId,
+          action: 'template.version_created',
+          entityType: 'onboarding_template',
+          entityId: newTemplate.id,
+          metadata: {
+            name: current.name,
+            departmentId: current.department_id,
+            version: newTemplate.version,
+            previousTemplateId: current.id,
+          },
+        },
+        client,
+      );
       return this.toTemplateWithTasks(client, newTemplate.id);
     });
   }

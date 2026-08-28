@@ -16,8 +16,8 @@ export class EntitlementsController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('superadmin_hr')
   @Post()
-  create(@Body() dto: CreateEntitlementDto) {
-    return this.entitlementsService.createEntitlement(dto);
+  create(@CurrentUser() actor: AuthenticatedUser, @Body() dto: CreateEntitlementDto) {
+    return this.entitlementsService.createEntitlement(dto, actor.id);
   }
 
   // Any authenticated user sees what's available to them — scoped
