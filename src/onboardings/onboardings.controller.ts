@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Header,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -46,6 +56,21 @@ export class OnboardingsController {
     @Query('status') status?: string,
   ) {
     return this.onboardingsService.listAllOnboardings({ departmentId, status });
+  }
+
+  // Step 28: CSV export. Same optional filters as listAll(). Notes are
+  // structurally absent from this query (OnboardingsService.
+  // exportOnboardingsCsv never joins that table) — not filtered out.
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('superadmin_hr')
+  @Header('Content-Type', 'text/csv')
+  @Header('Content-Disposition', 'attachment; filename="onboardings-export.csv"')
+  @Get('export')
+  export(
+    @Query('departmentId') departmentId?: string,
+    @Query('status') status?: string,
+  ) {
+    return this.onboardingsService.exportOnboardingsCsv({ departmentId, status });
   }
 
   // Step 26: the single-screen "what's stuck" view (BRD M6). One row

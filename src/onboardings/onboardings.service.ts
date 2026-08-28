@@ -13,6 +13,7 @@ import { CreateOnboardingDto } from './dto/create-onboarding.dto';
 import { ProvisionCompanyEmailDto } from './dto/provision-company-email.dto';
 import { computeDueDate } from './utils/due-date.util';
 import { isOverdueSql } from './utils/overdue.util';
+import { toCsv } from './utils/csv.util';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 
 /** Same structural-typing trick as TemplatesService — lets the read
@@ -266,6 +267,63 @@ export class OnboardingsService {
       [filters.departmentId ?? null, filters.status ?? null],
     );
     return rows;
+  }
+
+  /**
+   * Step 28: CSV export, one row per onboarding_task across every
+   * onboarding. This query never joins or selects from the notes
+   * table, anywhere — not filtered out, structurally absent. "Notes
+   * never appear in export, log, search, or any admin-facing query" is
+   * a non-negotiable precisely because a filter is something a future
+   * edit could accidentally loosen; a table that was never joined in
+   * the first place can't leak through one.
+   *
+   * Same optional-equality filters as listAllOnboardings, same caveat:
+   * not allow-listed yet (Step 32).
+   */
+  async exportOnboardingsCsv(filters: { departmentId?: string; status?: string }): Promise<string> {
+    const { rows } = await this.db.query(
+      `SELECT
+         u.full_name AS employee_name,
+         d.name AS department_name,
+         t.name AS template_name,
+         o.status AS onboarding_status,
+         o.start_date,
+         ot.title AS task_title,
+         ot.status AS task_status,
+         ot.priority,
+         ot.completion_mode,
+         ot.is_checkpoint,
+         ot.is_required,
+         ot.due_date,
+         ot.completed_at
+       FROM onboarding_tasks ot
+       JOIN onboardings o ON o.id = ot.onboarding_id
+       JOIN users u ON u.id = o.user_id
+       JOIN departments d ON d.id = o.department_id
+       JOIN onboarding_templates t ON t.id = o.template_id
+       WHERE ($1::uuid IS NULL OR o.department_id = $1)
+         AND ($2::text IS NULL OR o.status = $2)
+       ORDER BY d.name, u.full_name, ot.due_date`,
+      [filters.departmentId ?? null, filters.status ?? null],
+    );
+
+    const columns = [
+      'employee_name',
+      'department_name',
+      'template_name',
+      'onboarding_status',
+      'start_date',
+      'task_title',
+      'task_status',
+      'priority',
+      'completion_mode',
+      'is_checkpoint',
+      'is_required',
+      'due_date',
+      'completed_at',
+    ];
+    return toCsv(rows, columns);
   }
 
   /**
