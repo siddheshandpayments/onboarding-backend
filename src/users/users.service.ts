@@ -1,5 +1,16 @@
 import { Injectable } from '@nestjs/common';
+import { QueryResult, QueryResultRow } from 'pg';
 import { DatabaseService } from '../database/database.service';
+
+/** Same structural-typing trick as TemplatesService/OnboardingsService —
+ *  lets recordCompanyEmail() run either standalone or as part of a
+ *  caller's own transaction (see OnboardingsService.provisionCompanyEmail). */
+interface Queryable {
+  query<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    params?: unknown[],
+  ): Promise<QueryResult<T>>;
+}
 
 export interface UserRow {
   id: string;
@@ -85,9 +96,15 @@ export class UsersService {
   /** HR records the company email once IT/the company mail system has
    *  issued it. This does NOT enable login with it yet — see the
    *  users.company_email_active flip in AuthService on first successful
-   *  company-email login (Step 6). */
-  async recordCompanyEmail(userId: string, companyEmail: string) {
-    await this.db.query(
+   *  company-email login (Step 6). Accepts an optional queryable so
+   *  OnboardingsService.provisionCompanyEmail (Step 17) can run this in
+   *  the same transaction as its own onboardings.status flip. */
+  async recordCompanyEmail(
+    userId: string,
+    companyEmail: string,
+    queryable: Queryable = this.db,
+  ) {
+    await queryable.query(
       `UPDATE users
        SET company_email = $2, must_reset_password = true
        WHERE id = $1`,

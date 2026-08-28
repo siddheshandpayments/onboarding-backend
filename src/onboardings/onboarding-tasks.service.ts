@@ -5,6 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { PoolClient } from 'pg';
 import { DatabaseService } from '../database/database.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 
@@ -113,6 +114,12 @@ export class OnboardingTasksService {
    * `<column> IS NULL` guard in WHERE makes a double-confirmation from
    * the same side a no-op (0 rows) rather than silently overwriting
    * who confirmed it.
+   *
+   * When this confirmation is the one that completes the checkpoint
+   * (Step 17), two more things happen in the same transaction: every
+   * other 'locked' task on this onboarding flips to 'pending' — that's
+   * the actual "phase-2 gate" — and the onboarding itself advances to
+   * 'active'.
    */
   private async applyConfirmation(
     taskId: string,
@@ -121,20 +128,58 @@ export class OnboardingTasksService {
     otherConfirmedAtColumn: 'owner_confirmed_at' | 'employee_confirmed_at',
     actorId: string,
   ): Promise<OnboardingTaskRow> {
-    const { rows } = await this.db.query<OnboardingTaskRow>(
-      `UPDATE onboarding_tasks
-       SET ${confirmedByColumn} = $2,
-           ${confirmedAtColumn} = now(),
-           status = CASE WHEN ${otherConfirmedAtColumn} IS NOT NULL THEN 'completed' ELSE status END,
-           completed_at = CASE WHEN ${otherConfirmedAtColumn} IS NOT NULL THEN now() ELSE completed_at END
-       WHERE id = $1 AND ${confirmedAtColumn} IS NULL AND status <> 'cancelled'
-       RETURNING *`,
-      [taskId, actorId],
-    );
+    return this.db.transaction(async (client) => {
+      const { rows } = await client.query<OnboardingTaskRow>(
+        `UPDATE onboarding_tasks
+         SET ${confirmedByColumn} = $2,
+             ${confirmedAtColumn} = now(),
+             status = CASE WHEN ${otherConfirmedAtColumn} IS NOT NULL THEN 'completed' ELSE status END,
+             completed_at = CASE WHEN ${otherConfirmedAtColumn} IS NOT NULL THEN now() ELSE completed_at END
+         WHERE id = $1 AND ${confirmedAtColumn} IS NULL AND status <> 'cancelled'
+         RETURNING *`,
+        [taskId, actorId],
+      );
 
-    if (!rows[0]) {
-      throw new ConflictException('Already confirmed from this side');
-    }
-    return rows[0];
+      const task = rows[0];
+      if (!task) {
+        throw new ConflictException('Already confirmed from this side');
+      }
+
+      if (task.status === 'completed') {
+        await this.unlockPhaseTwoTasks(client, task.onboarding_id);
+        await this.activateOnboarding(client, task.onboarding_id);
+      }
+
+      return task;
+    });
+  }
+
+  /** The phase-2 gate itself: everything that started 'locked' at
+   *  instantiation (see OnboardingsService.insertOnboardingTask)
+   *  becomes actionable the moment the checkpoint is done. Tasks in
+   *  any other status (already 'pending'/'completed'/'cancelled') are
+   *  untouched. */
+  private async unlockPhaseTwoTasks(client: PoolClient, onboardingId: string) {
+    await client.query(
+      `UPDATE onboarding_tasks SET status = 'pending'
+       WHERE onboarding_id = $1 AND status = 'locked'`,
+      [onboardingId],
+    );
+  }
+
+  /** Third and final onboarding.status transition. Guarded on an
+   *  IN-list of every pre-active status rather than exactly
+   *  'checkpoint_pending' — the same reasoning as AuthService's
+   *  checkpoint_pending flip: HR/IT/the employee are independent
+   *  actors, so the checkpoint can realistically be confirmed before
+   *  the company email dance is finished. This only ever moves status
+   *  forward, and is a no-op if the onboarding is already active or
+   *  beyond. */
+  private async activateOnboarding(client: PoolClient, onboardingId: string) {
+    await client.query(
+      `UPDATE onboardings SET status = 'active'
+       WHERE id = $1 AND status IN ('pre_onboarding', 'email_provisioned', 'checkpoint_pending')`,
+      [onboardingId],
+    );
   }
 }

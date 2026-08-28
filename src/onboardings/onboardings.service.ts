@@ -9,6 +9,7 @@ import { DatabaseService } from '../database/database.service';
 import { UsersService } from '../users/users.service';
 import { TemplatesService } from '../templates/templates.service';
 import { CreateOnboardingDto } from './dto/create-onboarding.dto';
+import { ProvisionCompanyEmailDto } from './dto/provision-company-email.dto';
 import { computeDueDate } from './utils/due-date.util';
 
 /** Same structural-typing trick as TemplatesService — lets the read
@@ -142,6 +143,57 @@ export class OnboardingsService {
         status,
       ],
     );
+  }
+
+  /**
+   * Step 17, first of the two status transitions this module owns: HR
+   * recording the company email moves the onboarding from
+   * 'pre_onboarding' to 'email_provisioned'. Recording the email and
+   * flipping onboarding status happen in one transaction — see
+   * UsersService.recordCompanyEmail's optional queryable param.
+   *
+   * The guard is `status = 'pre_onboarding'` specifically (not a wider
+   * IN-list): unlike the checkpoint-completion transition below, there's
+   * exactly one legitimate prior state here, and re-provisioning a
+   * company email for an onboarding that's already past this point
+   * would be a mistake worth surfacing, not silently absorbing.
+   */
+  async provisionCompanyEmail(onboardingId: string, dto: ProvisionCompanyEmailDto) {
+    const { rows } = await this.db.query<OnboardingRow>(
+      `SELECT * FROM onboardings WHERE id = $1`,
+      [onboardingId],
+    );
+    const onboarding = rows[0];
+    if (!onboarding) {
+      throw new NotFoundException('Onboarding not found');
+    }
+    if (onboarding.status !== 'pre_onboarding') {
+      throw new ConflictException(
+        `Cannot provision a company email from status '${onboarding.status}'`,
+      );
+    }
+
+    return this.db.transaction(async (client) => {
+      await this.usersService.recordCompanyEmail(
+        onboarding.user_id,
+        dto.companyEmail,
+        client,
+      );
+
+      const { rows: updatedRows } = await client.query<OnboardingRow>(
+        `UPDATE onboardings SET status = 'email_provisioned'
+         WHERE id = $1 AND status = 'pre_onboarding'
+         RETURNING *`,
+        [onboardingId],
+      );
+      const updated = updatedRows[0];
+      if (!updated) {
+        throw new ConflictException(
+          'Onboarding status changed concurrently — company email not provisioned',
+        );
+      }
+      return updated;
+    });
   }
 
   /** Used by ClaimedAccountGuard (KnowledgeModule) to check the caller's

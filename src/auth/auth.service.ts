@@ -7,6 +7,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import { UsersService, UserRow } from '../users/users.service';
+import { DatabaseService } from '../database/database.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { generateLoginEmail, generateTempPassword } from './utils/credential-generator';
 import { generateTotpEnrollment, verifyTotpCode } from './utils/totp';
@@ -39,6 +40,11 @@ export class AuthService {
     private readonly usersService: UsersService,
     private readonly config: ConfigService,
     private readonly tokens: TokenService,
+    // Global provider (DatabaseModule is @Global()) — injected directly
+    // here rather than importing OnboardingsModule, which would create
+    // a circular module dependency (OnboardingsModule already imports
+    // AuthModule for its guards). See completeCompanyEmailPasswordReset.
+    private readonly db: DatabaseService,
   ) {}
 
   async createUser(dto: CreateUserDto) {
@@ -262,6 +268,20 @@ export class AuthService {
     const passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
     await this.usersService.setPasswordHash(userId, passwordHash, false);
     await this.usersService.setCompanyEmailActive(userId);
+
+    // Step 17: first successful company-email login is the trigger for
+    // the onboarding's second status transition. Guarded on an IN-list
+    // rather than exactly 'email_provisioned' because provisioning and
+    // this first login aren't strictly ordered by the system (HR, IT,
+    // and the employee are independent actors) — this only ever moves
+    // status forward, never backward, and is a no-op for accounts with
+    // no onboarding at all (task_owner/superadmin_hr).
+    await this.db.query(
+      `UPDATE onboardings SET status = 'checkpoint_pending'
+       WHERE user_id = $1 AND status IN ('pre_onboarding', 'email_provisioned')`,
+      [userId],
+    );
+
     return this.progressFor(userId, sessionTotpVerified);
   }
 
