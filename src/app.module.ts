@@ -4,6 +4,7 @@ import { DatabaseModule } from './database/database.module';
 import { TemplatesModule } from './templates/templates.module';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
+import { OnboardingsModule } from './onboardings/onboardings.module';
 
 @Module({
   imports: [
@@ -17,8 +18,9 @@ import { AuthModule } from './auth/auth.module';
     TemplatesModule,
     UsersModule,
     AuthModule,
-    // Remaining feature modules (OnboardingsModule, KnowledgeModule, ...)
-    // get added here as later steps build them.
+    OnboardingsModule,
+    // Remaining feature modules (KnowledgeModule, ...) get added here
+    // as later steps build them.
   ],
 })
 export class AppModule {}
