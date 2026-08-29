@@ -283,55 +283,182 @@ export class OnboardingsService {
    * allow-list check has already validated the requested sort field.
    */
   async listAllOnboardings(query: Record<string, string | undefined>) {
-    assertOnlyAllowedKeys(query, ['department', 'status', 'health', 'dateFrom', 'dateTo', 'sort']);
+    assertOnlyAllowedKeys(query, [
+      'department',
+      'status',
+      'health',
+      'dateFrom',
+      'dateTo',
+      'sort',
+      'limit',
+      'offset',
+    ]);
+
     assertUuidIfPresent(query.department, 'department');
     assertOneOfIfPresent(query.status, 'status', ONBOARDING_STATUS_VALUES);
     assertOneOfIfPresent(query.health, 'health', HEALTH_VALUES);
     assertDateIfPresent(query.dateFrom, 'dateFrom');
     assertDateIfPresent(query.dateTo, 'dateTo');
+
     const { field, direction } = parseSort(
       query.sort,
       Object.keys(ONBOARDING_SORT_EXPRESSIONS),
       'startDate',
     );
 
+    /*
+    * Pagination
+    *
+    * Defaults:
+    *   limit = 20
+    *   offset = 0
+    *
+    * The limit must be between 1 and 100.
+    */
+    const limit = query.limit === undefined ? 20 : Number(query.limit);
+    const offset = query.offset === undefined ? 0 : Number(query.offset);
+
+    if (
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 100
+    ) {
+      throw new BadRequestException(
+        "'limit' must be an integer between 1 and 100",
+      );
+    }
+
+    if (
+      !Number.isInteger(offset) ||
+      offset < 0
+    ) {
+      throw new BadRequestException(
+        "'offset' must be a non-negative integer",
+      );
+    }
+
     const stuckExists = `EXISTS (
-      SELECT 1 FROM onboarding_tasks ot2
-      WHERE ot2.onboarding_id = o.id AND ot2.is_required = true
-        AND (ot2.status = 'blocked' OR ${isOverdueSql('ot2.')})
+      SELECT 1
+      FROM onboarding_tasks ot2
+      WHERE ot2.onboarding_id = o.id
+        AND ot2.is_required = true
+        AND (
+          ot2.status = 'blocked'
+          OR ${isOverdueSql('ot2.')}
+        )
     )`;
-    // Resolved from the already-validated `health` value above, one of
-    // exactly three fixed literal strings — never client-interpolated.
+
     const healthCondition =
-      query.health === 'stuck' ? stuckExists : query.health === 'on_track' ? `NOT ${stuckExists}` : 'true';
+      query.health === 'stuck'
+        ? stuckExists
+        : query.health === 'on_track'
+          ? `NOT ${stuckExists}`
+          : 'true';
 
     const { rows } = await this.db.query(
-      `SELECT * FROM (
-         SELECT
-           o.id, o.user_id, o.department_id, o.template_id, o.template_version,
-           o.start_date, o.status, o.created_at, o.updated_at,
-           u.full_name AS employee_name,
-           d.name AS department_name,
-           t.name AS template_name,
-           (SELECT COUNT(*) FROM onboarding_tasks ot
-              WHERE ot.onboarding_id = o.id AND ot.is_required = true)::int AS required_task_count,
-           (SELECT COUNT(*) FROM onboarding_tasks ot
-              WHERE ot.onboarding_id = o.id AND ot.is_required = true
-                AND ot.status = 'completed')::int AS required_task_completed_count
-         FROM onboardings o
-         JOIN users u ON u.id = o.user_id
-         JOIN departments d ON d.id = o.department_id
-         JOIN onboarding_templates t ON t.id = o.template_id
-         WHERE ($1::uuid IS NULL OR o.department_id = $1)
-           AND ($2::text IS NULL OR o.status = $2)
-           AND ($3::date IS NULL OR o.start_date >= $3)
-           AND ($4::date IS NULL OR o.start_date <= $4)
-           AND ${healthCondition}
-       ) AS onboarding_rows
-       ORDER BY ${ONBOARDING_SORT_EXPRESSIONS[field]} ${direction}`,
-      [query.department ?? null, query.status ?? null, query.dateFrom ?? null, query.dateTo ?? null],
+      `SELECT *
+      FROM (
+        SELECT
+          o.id,
+          o.user_id,
+          o.department_id,
+          o.template_id,
+          o.template_version,
+          o.start_date,
+          o.status,
+          o.created_at,
+          o.updated_at,
+          u.full_name AS employee_name,
+          d.name AS department_name,
+          t.name AS template_name,
+
+          (
+            SELECT COUNT(*)
+            FROM onboarding_tasks ot
+            WHERE ot.onboarding_id = o.id
+              AND ot.is_required = true
+          )::int AS required_task_count,
+
+          (
+            SELECT COUNT(*)
+            FROM onboarding_tasks ot
+            WHERE ot.onboarding_id = o.id
+              AND ot.is_required = true
+              AND ot.status = 'completed'
+          )::int AS required_task_completed_count
+
+        FROM onboardings o
+
+        JOIN users u
+          ON u.id = o.user_id
+
+        JOIN departments d
+          ON d.id = o.department_id
+
+        JOIN onboarding_templates t
+          ON t.id = o.template_id
+
+        WHERE ($1::uuid IS NULL OR o.department_id = $1)
+          AND ($2::text IS NULL OR o.status = $2)
+          AND ($3::date IS NULL OR o.start_date >= $3)
+          AND ($4::date IS NULL OR o.start_date <= $4)
+          AND ${healthCondition}
+      ) AS onboarding_rows
+
+      ORDER BY ${ONBOARDING_SORT_EXPRESSIONS[field]} ${direction}
+
+      LIMIT $5
+      OFFSET $6`,
+      [
+        query.department ?? null,
+        query.status ?? null,
+        query.dateFrom ?? null,
+        query.dateTo ?? null,
+        limit,
+        offset,
+      ],
     );
-    return rows;
+
+    /*
+    * Get the total number of rows matching the filters.
+    *
+    * This is deliberately separate from the paginated query because
+    * `rows.length` only tells us how many rows are on this page.
+    */
+    const { rows: countRows } = await this.db.query<{ total: string }>(
+      `SELECT COUNT(*)::int AS total
+      FROM onboardings o
+
+      JOIN users u
+        ON u.id = o.user_id
+
+      JOIN departments d
+        ON d.id = o.department_id
+
+      JOIN onboarding_templates t
+        ON t.id = o.template_id
+
+      WHERE ($1::uuid IS NULL OR o.department_id = $1)
+        AND ($2::text IS NULL OR o.status = $2)
+        AND ($3::date IS NULL OR o.start_date >= $3)
+        AND ($4::date IS NULL OR o.start_date <= $4)
+        AND ${healthCondition}`,
+      [
+        query.department ?? null,
+        query.status ?? null,
+        query.dateFrom ?? null,
+        query.dateTo ?? null,
+      ],
+    );
+
+    const total = Number(countRows[0]?.total ?? 0);
+
+    return {
+      data: rows,
+      total,
+      limit,
+      offset,
+    };
   }
 
   /**
