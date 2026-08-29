@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_FILTER } from '@nestjs/core';
+import { DepartmentsModule } from './departments/departments.module';
 
 import { DatabaseModule } from './database/database.module';
 import { TemplatesModule } from './templates/templates.module';
@@ -26,6 +27,7 @@ import { AllExceptionsFilter } from './common/all-exceptions.filter';
     }),
 
     DatabaseModule,
+    DepartmentsModule,
     ActivityLogModule,
     TemplatesModule,
     UsersModule,
