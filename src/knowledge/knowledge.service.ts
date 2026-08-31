@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
+import { Pagination, paginateRows } from '../common/list-query.util';
 
 export interface KnowledgeArticleRow {
   id: string;
@@ -23,28 +24,36 @@ export class KnowledgeService {
    *  comes straight from the query string since there's no identity
    *  to derive it from; it's the same content either way, just
    *  narrowed to one department's public articles on request. */
-  listPublicArticles(departmentId?: string) {
-    return this.queryArticles(PUBLIC_VISIBILITIES, departmentId ?? null);
+  listPublicArticles(departmentId: string | undefined, pagination: Pagination) {
+    return this.queryArticles(PUBLIC_VISIBILITIES, departmentId ?? null, pagination);
   }
 
   /** Called only with a departmentId already resolved from the
    *  caller's own onboarding (see ClaimedAccountGuard) — never a
    *  client-supplied value, so a claimed-but-pre-checkpoint employee
    *  can't request another department's pre_email_auth content. */
-  listPreCheckpointArticles(departmentId: string) {
-    return this.queryArticles(PRE_CHECKPOINT_VISIBILITIES, departmentId);
+  listPreCheckpointArticles(departmentId: string, pagination: Pagination) {
+    return this.queryArticles(PRE_CHECKPOINT_VISIBILITIES, departmentId, pagination);
   }
 
-  private async queryArticles(visibilities: string[], departmentId: string | null) {
-    const { rows } = await this.db.query<KnowledgeArticleRow>(
-      `SELECT id, category_id, title, content, department_id, visibility, created_at, updated_at
+  /** Step 33: LIMIT/OFFSET pagination via the shared
+   *  COUNT(*) OVER()/paginateRows() pattern. */
+  private async queryArticles(
+    visibilities: string[],
+    departmentId: string | null,
+    pagination: Pagination,
+  ) {
+    const { rows } = await this.db.query<KnowledgeArticleRow & { total_count: number }>(
+      `SELECT id, category_id, title, content, department_id, visibility, created_at, updated_at,
+              COUNT(*) OVER()::int AS total_count
        FROM knowledge_articles
        WHERE is_published = true
          AND visibility = ANY($1::text[])
          AND (department_id IS NULL OR department_id = $2)
-       ORDER BY created_at DESC`,
-      [visibilities, departmentId],
+       ORDER BY created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [visibilities, departmentId, pagination.limit, pagination.offset],
     );
-    return rows;
+    return paginateRows(rows, pagination);
   }
 }

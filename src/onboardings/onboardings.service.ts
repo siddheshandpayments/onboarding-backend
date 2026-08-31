@@ -4,13 +4,18 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import * as bcrypt from 'bcrypt';
 import { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { DatabaseService } from '../database/database.service';
+import { generateTempPassword } from '../auth/utils/credential-generator';
 import { UsersService } from '../users/users.service';
 import { TemplatesService } from '../templates/templates.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateOnboardingDto } from './dto/create-onboarding.dto';
 import { ProvisionCompanyEmailDto } from './dto/provision-company-email.dto';
+import { CreateAdHocTaskDto } from './dto/create-ad-hoc-task.dto';
+import { RateExperienceDto } from './dto/rate-experience.dto';
 import { computeDueDate } from './utils/due-date.util';
 import { isOverdueSql } from './utils/overdue.util';
 import { toCsv } from './utils/csv.util';
@@ -75,6 +80,7 @@ export interface OnboardingRow {
 }
 
 const UNIQUE_VIOLATION = '23505';
+const BCRYPT_ROUNDS = 12;
 
 @Injectable()
 export class OnboardingsService {
@@ -83,6 +89,7 @@ export class OnboardingsService {
     private readonly usersService: UsersService,
     private readonly templatesService: TemplatesService,
     private readonly activityLog: ActivityLogService,
+    private readonly config: ConfigService,
   ) {}
 
   /**
@@ -227,11 +234,28 @@ export class OnboardingsService {
         `Cannot provision a company email from status '${onboarding.status}'`,
       );
     }
+    const user = await this.usersService.findById(onboarding.user_id);
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
 
-    return this.db.transaction(async (client) => {
+    const tempPassword = generateTempPassword();
+    const passwordHash = await bcrypt.hash(tempPassword, BCRYPT_ROUNDS);
+
+    const { onboardingUpdated, companyEmail } = await this.db.transaction(async (client) => {
+      // A manual companyEmail is a deliberate override; the normal
+      // path (HR clicks one button, nothing typed) omits it and gets
+      // name@domain / name1@domain / ... — see
+      // UsersService.generateUniqueCompanyEmail.
+      const domain = this.config.get<string>('COMPANY_EMAIL_DOMAIN')!;
+      const resolvedEmail =
+        dto.companyEmail ??
+        (await this.usersService.generateUniqueCompanyEmail(user.full_name, domain, client));
+
       await this.usersService.recordCompanyEmail(
         onboarding.user_id,
-        dto.companyEmail,
+        resolvedEmail,
+        passwordHash,
         client,
       );
 
@@ -261,8 +285,159 @@ export class OnboardingsService {
         client,
       );
 
-      return updated;
+      // Auto-assign every still-unclaimed task_owner-role task on this
+      // onboarding (laptop handover, meet-manager, etc.) to the named
+      // IT contact, the moment their actual trigger — the company
+      // email going out — happens. A missing 'Bhupendra' account
+      // (a different demo seed, a renamed contact) just means nothing
+      // gets auto-claimed; HR/the task owner can still claim manually.
+      const { rows: itRows } = await client.query<{ id: string }>(
+        `SELECT id FROM users WHERE role = 'task_owner' AND full_name = 'Bhupendra' AND deleted_at IS NULL LIMIT 1`,
+      );
+      const itContactId = itRows[0]?.id;
+      if (itContactId) {
+        const { rows: claimedTasks } = await client.query<{ id: string }>(
+          `UPDATE onboarding_tasks
+           SET owner_user_id = $2
+           WHERE onboarding_id = $1 AND owner_role = 'task_owner' AND owner_user_id IS NULL
+           RETURNING id`,
+          [onboardingId, itContactId],
+        );
+        for (const task of claimedTasks) {
+          await this.activityLog.log(
+            {
+              actorId,
+              action: 'onboarding_task.auto_assigned',
+              entityType: 'onboarding_task',
+              entityId: task.id,
+              metadata: { assignedTo: itContactId },
+            },
+            client,
+          );
+        }
+      }
+
+      return { onboardingUpdated: updated, companyEmail: resolvedEmail };
     });
+
+    return {
+      onboarding: onboardingUpdated,
+      credentials: {
+        loginEmail: companyEmail,
+        temporaryPassword: tempPassword,
+        note: 'Shown once. Deliver to the employee directly — their old temp login no longer works once they use this.',
+      },
+    };
+  }
+
+  /**
+   * The task scheduler: HR adding a one-off task onto an already-
+   * running onboarding, outside anything the template snapshotted in.
+   * Always starts 'pending' (immediately actionable, never 'locked' —
+   * there's no phase-2 gate for a task that didn't come from the
+   * template) and is never a checkpoint. source_template_task_id
+   * stays NULL, which is exactly how the schema already distinguishes
+   * "traceable to a template" from "not" for any task.
+   */
+  async createAdHocTask(onboardingId: string, dto: CreateAdHocTaskDto, actorId: string) {
+    const onboarding = await this.getOnboardingOrThrow(onboardingId);
+
+    const { rows } = await this.db.query(
+      `INSERT INTO onboarding_tasks (
+         onboarding_id, source_template_task_id, title, description,
+         owner_role, due_date, priority, is_required, completion_mode,
+         is_checkpoint, status
+       ) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, false, 'pending')
+       RETURNING *`,
+      [
+        onboarding.id,
+        dto.title,
+        dto.description ?? null,
+        dto.ownerRole,
+        dto.dueDate,
+        dto.priority,
+        dto.isRequired,
+        dto.completionMode,
+      ],
+    );
+
+    await this.activityLog.log({
+      actorId,
+      action: 'onboarding_task.scheduled',
+      entityType: 'onboarding_task',
+      entityId: rows[0].id,
+      metadata: { onboardingId: onboarding.id, title: dto.title },
+    });
+
+    return rows[0];
+  }
+
+  /** HR's view into one onboarding's full task list — every status,
+   *  not just the actionable subset getMyDashboard's buckets show the
+   *  employee themselves. Read-only from this side: completion still
+   *  only happens through the employee/task_owner endpoints, which
+   *  keeps "who is allowed to mark a task done" in exactly one place. */
+  async getOnboardingTasks(onboardingId: string) {
+    await this.getOnboardingOrThrow(onboardingId);
+    const { rows } = await this.db.query(
+      `SELECT id, title, description, owner_role, due_date, priority,
+              is_required, completion_mode, is_checkpoint, status,
+              ${isOverdueSql()} AS is_overdue
+       FROM onboarding_tasks
+       WHERE onboarding_id = $1
+       ORDER BY due_date, created_at`,
+      [onboardingId],
+    );
+    return rows;
+  }
+
+  private async getOnboardingOrThrow(onboardingId: string): Promise<OnboardingRow> {
+    const { rows } = await this.db.query<OnboardingRow>(
+      `SELECT * FROM onboardings WHERE id = $1`,
+      [onboardingId],
+    );
+    const onboarding = rows[0];
+    if (!onboarding) {
+      throw new NotFoundException('Onboarding not found');
+    }
+    return onboarding;
+  }
+
+  /**
+   * An employee rating their own onboarding experience — upsert, not
+   * insert-only, so changing your mind just overwrites the previous
+   * rating rather than accumulating a history nobody asked for.
+   * Scoped by the caller's own onboarding, same pattern as
+   * getMyDashboard: never accepts an onboarding id from the client.
+   */
+  async rateExperience(actor: AuthenticatedUser, dto: RateExperienceDto) {
+    const onboarding = await this.findByUserId(actor.id);
+    if (!onboarding) {
+      throw new NotFoundException('No onboarding found for this account');
+    }
+    const { rows } = await this.db.query<OnboardingRow>(
+      `UPDATE onboardings
+       SET experience_rating = $2, experience_comment = $3, experience_rated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+      [onboarding.id, dto.rating, dto.comment ?? null],
+    );
+    return rows[0];
+  }
+
+  /** HR's "first-week feedback" widget — company-wide average and
+   *  count, computed live from every onboarding that has a rating
+   *  set, never a stored aggregate that could drift. */
+  async getRatingSummary() {
+    const { rows } = await this.db.query<{ average: string | null; count: string }>(
+      `SELECT AVG(experience_rating)::numeric(10,2) AS average, COUNT(*)::int AS count
+       FROM onboardings
+       WHERE experience_rating IS NOT NULL`,
+    );
+    return {
+      average: rows[0].average ? Number(rows[0].average) : null,
+      count: Number(rows[0].count),
+    };
   }
 
   /**
@@ -548,11 +723,31 @@ export class OnboardingsService {
    * does have one.
    */
   async listStuckTasks(query: Record<string, string | undefined>) {
-    assertOnlyAllowedKeys(query, ['department', 'owner', 'priority', 'sort']);
+    assertOnlyAllowedKeys(query, ['department', 'owner', 'priority', 'sort', 'limit', 'offset']);
     assertUuidIfPresent(query.department, 'department');
     assertUuidIfPresent(query.owner, 'owner');
     assertOneOfIfPresent(query.priority, 'priority', PRIORITY_VALUES);
     const { field, direction } = parseSort(query.sort, Object.keys(STUCK_SORT_EXPRESSIONS), 'dueDate');
+
+    // Same hand-rolled limit/offset + separate COUNT(*) pattern as
+    // listAllOnboardings above, for consistency within this file.
+    const limit = query.limit === undefined ? 20 : Number(query.limit);
+    const offset = query.offset === undefined ? 0 : Number(query.offset);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new BadRequestException("'limit' must be an integer between 1 and 100");
+    }
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new BadRequestException("'offset' must be a non-negative integer");
+    }
+
+    const stuckWhere = `o.status NOT IN ('completed', 'cancelled')
+         AND ot.is_required = true
+         AND ot.status NOT IN ('completed', 'cancelled')
+         AND (ot.status = 'blocked' OR ${isOverdueSql('ot.')})
+         AND ($1::uuid IS NULL OR o.department_id = $1)
+         AND ($2::uuid IS NULL OR ot.owner_user_id = $2)
+         AND ($3::text IS NULL OR ot.priority = $3)`;
+    const filterParams = [query.department ?? null, query.owner ?? null, query.priority ?? null];
 
     const { rows } = await this.db.query(
       `SELECT
@@ -573,17 +768,22 @@ export class OnboardingsService {
        JOIN onboardings o ON o.id = ot.onboarding_id
        JOIN users u ON u.id = o.user_id
        JOIN departments d ON d.id = o.department_id
-       WHERE o.status NOT IN ('completed', 'cancelled')
-         AND ot.is_required = true
-         AND ot.status NOT IN ('completed', 'cancelled')
-         AND (ot.status = 'blocked' OR ${isOverdueSql('ot.')})
-         AND ($1::uuid IS NULL OR o.department_id = $1)
-         AND ($2::uuid IS NULL OR ot.owner_user_id = $2)
-         AND ($3::text IS NULL OR ot.priority = $3)
-       ORDER BY ${STUCK_SORT_EXPRESSIONS[field]} ${direction}`,
-      [query.department ?? null, query.owner ?? null, query.priority ?? null],
+       WHERE ${stuckWhere}
+       ORDER BY ${STUCK_SORT_EXPRESSIONS[field]} ${direction}
+       LIMIT $4 OFFSET $5`,
+      [...filterParams, limit, offset],
     );
-    return rows;
+
+    const { rows: countRows } = await this.db.query<{ total: string }>(
+      `SELECT COUNT(*)::int AS total
+       FROM onboarding_tasks ot
+       JOIN onboardings o ON o.id = ot.onboarding_id
+       WHERE ${stuckWhere}`,
+      filterParams,
+    );
+    const total = Number(countRows[0]?.total ?? 0);
+
+    return { data: rows, total, limit, offset };
   }
 
   /**
@@ -652,11 +852,31 @@ export class OnboardingsService {
     const requiredTotal = Number(progressRows[0].required_total);
     const requiredCompleted = Number(progressRows[0].required_completed);
 
+    // Required-only, every status included (unlike the three buckets
+    // above) — this is what a "your onboarding journey" step list
+    // renders: completed steps with a checkmark, one current step,
+    // the rest as upcoming. Order matches how the employee will
+    // actually move through it.
+    const { rows: steps } = await this.db.query<{
+      id: string;
+      title: string;
+      status: string;
+      due_date: Date;
+      is_checkpoint: boolean;
+    }>(
+      `SELECT id, title, status, due_date, is_checkpoint
+       FROM onboarding_tasks
+       WHERE onboarding_id = $1 AND is_required = true
+       ORDER BY due_date, created_at`,
+      [onboarding.id],
+    );
+
     return {
       onboarding,
       today: bucketedTasks.filter((t) => t.bucket === 'today'),
       upcoming: bucketedTasks.filter((t) => t.bucket === 'upcoming'),
       overdue: bucketedTasks.filter((t) => t.bucket === 'overdue'),
+      steps,
       progress: {
         requiredTotal,
         requiredCompleted,

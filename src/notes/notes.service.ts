@@ -2,6 +2,7 @@ import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/commo
 import { DatabaseService } from '../database/database.service';
 import { CreateNoteDto } from './dto/create-note.dto';
 import { UpdateNoteDto } from './dto/update-note.dto';
+import { Pagination, paginateRows } from '../common/list-query.util';
 
 export interface NoteRow {
   id: string;
@@ -42,12 +43,41 @@ export class NotesService {
     return rows[0];
   }
 
-  async listNotes(actorId: string): Promise<NoteRow[]> {
-    const { rows } = await this.db.query<NoteRow>(
-      `SELECT * FROM notes WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`,
-      [actorId],
+  /** Step 33: LIMIT/OFFSET pagination via the shared
+   *  COUNT(*) OVER()/paginateRows() pattern — still hard-scoped to
+   *  `WHERE user_id = $actorId`, pagination changes nothing about that. */
+  async listNotes(actorId: string, pagination: Pagination) {
+    const { rows } = await this.db.query<NoteRow & { total_count: number }>(
+      `SELECT *, COUNT(*) OVER()::int AS total_count FROM notes
+       WHERE user_id = $1 AND deleted_at IS NULL
+       ORDER BY created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [actorId, pagination.limit, pagination.offset],
     );
-    return rows;
+    return paginateRows(rows, pagination);
+  }
+
+  /**
+   * SuperAdmin/HR gets visibility into note CONTENT company-wide, but
+   * never who wrote which one — same anonymity mechanism as
+   * CommunityService's author hiding: the SELECT itself never
+   * projects user_id, so there's no value to redact and no code path
+   * that could accidentally leak it later. This is a genuinely
+   * different capability from getNote/assertOwnedOrThrow above (which
+   * stays exactly as strict as before), not a loosening of it.
+   */
+  async listAllForAdmin(pagination: Pagination) {
+    const { rows } = await this.db.query<
+      Pick<NoteRow, 'id' | 'content' | 'created_at' | 'updated_at'> & { total_count: number }
+    >(
+      `SELECT id, content, created_at, updated_at, COUNT(*) OVER()::int AS total_count
+       FROM notes
+       WHERE deleted_at IS NULL
+       ORDER BY created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [pagination.limit, pagination.offset],
+    );
+    return paginateRows(rows, pagination);
   }
 
   async getNote(actorId: string, noteId: string): Promise<NoteRow> {

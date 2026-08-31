@@ -1,11 +1,13 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
+import { Pagination, paginateRows } from '../common/list-query.util';
 
 export interface CommunityPostRow {
   id: string;
   body: string;
   created_at: Date;
+  is_question: boolean;
   // Both null unless the viewer IS the author — see the CASE
   // expressions in every query below. Not filtered out after the
   // fact: the real value never leaves the database for anyone else.
@@ -60,36 +62,45 @@ export class CommunityService {
     private readonly activityLog: ActivityLogService,
   ) {}
 
-  async createPost(actorId: string, body: string): Promise<CommunityPostRow> {
+  async createPost(actorId: string, body: string, isQuestion = false): Promise<CommunityPostRow> {
     const { rows } = await this.db.query<{ id: string }>(
-      `INSERT INTO community_posts (author_id, body) VALUES ($1, $2) RETURNING id`,
-      [actorId, body],
+      `INSERT INTO community_posts (author_id, body, is_question) VALUES ($1, $2, $3) RETURNING id`,
+      [actorId, body, isQuestion],
     );
     return this.getPostOrThrow(rows[0].id, actorId);
   }
 
-  async listPosts(viewerId: string): Promise<CommunityPostRow[]> {
-    const { rows } = await this.db.query<CommunityPostRow>(
-      `SELECT
-         cp.id, cp.body, cp.created_at,
-         CASE WHEN cp.author_id = $1 THEN cp.author_id ELSE NULL END AS author_id,
-         CASE WHEN cp.author_id = $1 THEN u.full_name ELSE NULL END AS author_name,
-         (cp.author_id = $1) AS is_mine,
-         COUNT(*) FILTER (WHERE cv.value = 1)::int AS upvotes,
-         COUNT(*) FILTER (WHERE cv.value = -1)::int AS downvotes,
-         COALESCE(SUM(cv.value), 0)::int AS score,
-         (SELECT COUNT(*) FROM community_comments cc
-            WHERE cc.post_id = cp.id AND cc.deleted_at IS NULL)::int AS comment_count,
-         MAX(CASE WHEN cv.user_id = $1 THEN cv.value END) AS my_vote
-       FROM community_posts cp
-       JOIN users u ON u.id = cp.author_id
-       LEFT JOIN community_votes cv ON cv.post_id = cp.id
-       WHERE cp.deleted_at IS NULL
-       GROUP BY cp.id, cp.body, cp.created_at, cp.author_id, u.full_name
-       ORDER BY cp.created_at DESC`,
-      [viewerId],
+  /** Step 33: LIMIT/OFFSET pagination. The base query already GROUPs
+   *  by post for the vote/comment aggregates, so ORDER BY and LIMIT/
+   *  OFFSET move to an outer wrapping query rather than living inside
+   *  the grouped one — SQL doesn't guarantee a subquery's internal
+   *  ORDER BY survives being read from outside it, so it has to be
+   *  re-stated at the level LIMIT/OFFSET actually apply. */
+  async listPosts(viewerId: string, pagination: Pagination) {
+    const { rows } = await this.db.query<CommunityPostRow & { total_count: number }>(
+      `SELECT *, COUNT(*) OVER()::int AS total_count FROM (
+         SELECT
+           cp.id, cp.body, cp.created_at, cp.is_question,
+           CASE WHEN cp.author_id = $1 THEN cp.author_id ELSE NULL END AS author_id,
+           CASE WHEN cp.author_id = $1 THEN u.full_name ELSE NULL END AS author_name,
+           (cp.author_id = $1) AS is_mine,
+           COUNT(*) FILTER (WHERE cv.value = 1)::int AS upvotes,
+           COUNT(*) FILTER (WHERE cv.value = -1)::int AS downvotes,
+           COALESCE(SUM(cv.value), 0)::int AS score,
+           (SELECT COUNT(*) FROM community_comments cc
+              WHERE cc.post_id = cp.id AND cc.deleted_at IS NULL)::int AS comment_count,
+           MAX(CASE WHEN cv.user_id = $1 THEN cv.value END) AS my_vote
+         FROM community_posts cp
+         JOIN users u ON u.id = cp.author_id
+         LEFT JOIN community_votes cv ON cv.post_id = cp.id
+         WHERE cp.deleted_at IS NULL
+         GROUP BY cp.id, cp.body, cp.created_at, cp.is_question, cp.author_id, u.full_name
+       ) AS post_rows
+       ORDER BY created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [viewerId, pagination.limit, pagination.offset],
     );
-    return rows;
+    return paginateRows(rows, pagination);
   }
 
   async getPostWithComments(postId: string, viewerId: string) {
@@ -183,6 +194,32 @@ export class CommunityService {
     });
   }
 
+  /**
+   * Same shape as deletePost: scoped entirely by comment id, never
+   * reads or logs author_id, deleted_by records the moderating
+   * admin's own id. Once deleted_at is set, getPostWithComments'
+   * `AND cc.deleted_at IS NULL` already stops returning it.
+   */
+  async deleteComment(commentId: string, actorId: string, reason: string): Promise<void> {
+    const { rowCount } = await this.db.query(
+      `UPDATE community_comments
+       SET deleted_at = now(), deleted_by = $2, delete_reason = $3
+       WHERE id = $1 AND deleted_at IS NULL`,
+      [commentId, actorId, reason],
+    );
+    if (!rowCount) {
+      throw new NotFoundException('Comment not found');
+    }
+
+    await this.activityLog.log({
+      actorId,
+      action: 'community_comment.deleted',
+      entityType: 'community_comment',
+      entityId: commentId,
+      metadata: { reason },
+    });
+  }
+
   private async assertPostExists(postId: string): Promise<void> {
     const { rows } = await this.db.query(
       `SELECT id FROM community_posts WHERE id = $1 AND deleted_at IS NULL`,
@@ -196,7 +233,7 @@ export class CommunityService {
   private async getPostOrThrow(postId: string, viewerId: string): Promise<CommunityPostRow> {
     const { rows } = await this.db.query<CommunityPostRow>(
       `SELECT
-         cp.id, cp.body, cp.created_at,
+         cp.id, cp.body, cp.created_at, cp.is_question,
          CASE WHEN cp.author_id = $2 THEN cp.author_id ELSE NULL END AS author_id,
          CASE WHEN cp.author_id = $2 THEN u.full_name ELSE NULL END AS author_name,
          (cp.author_id = $2) AS is_mine,
@@ -210,7 +247,7 @@ export class CommunityService {
        JOIN users u ON u.id = cp.author_id
        LEFT JOIN community_votes cv ON cv.post_id = cp.id
        WHERE cp.id = $1 AND cp.deleted_at IS NULL
-       GROUP BY cp.id, cp.body, cp.created_at, cp.author_id, u.full_name`,
+       GROUP BY cp.id, cp.body, cp.created_at, cp.is_question, cp.author_id, u.full_name`,
       [postId, viewerId],
     );
     const post = rows[0];

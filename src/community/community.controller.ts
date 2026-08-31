@@ -7,6 +7,7 @@ import {
   Param,
   ParseUUIDPipe,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -19,6 +20,8 @@ import { CreatePostDto } from './dto/create-post.dto';
 import { CreateCommentDto } from './dto/create-comment.dto';
 import { CastVoteDto } from './dto/cast-vote.dto';
 import { DeletePostDto } from './dto/delete-post.dto';
+import { DeleteCommentDto } from './dto/delete-comment.dto';
+import { parsePagination } from '../common/list-query.util';
 
 // No @Roles() anywhere here — community is open to every authenticated
 // role (employees, task owners, HR/SuperAdmin all share the same
@@ -32,13 +35,18 @@ export class CommunityController {
   @UseGuards(JwtAuthGuard)
   @Post()
   createPost(@CurrentUser() actor: AuthenticatedUser, @Body() dto: CreatePostDto) {
-    return this.communityService.createPost(actor.id, dto.body);
+    return this.communityService.createPost(actor.id, dto.body, dto.isQuestion);
   }
 
+  // Step 33: limit/offset pagination.
   @UseGuards(JwtAuthGuard)
   @Get()
-  listPosts(@CurrentUser() actor: AuthenticatedUser) {
-    return this.communityService.listPosts(actor.id);
+  listPosts(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    return this.communityService.listPosts(actor.id, parsePagination({ limit, offset }));
   }
 
   @UseGuards(JwtAuthGuard)
@@ -81,5 +89,19 @@ export class CommunityController {
     @Body() dto: DeletePostDto,
   ) {
     await this.communityService.deletePost(id, actor.id, dto.reason);
+  }
+
+  // Same moderation privilege as deletePost, scoped to one comment
+  // instead of the whole post.
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('superadmin_hr')
+  @Delete(':postId/comments/:commentId')
+  @HttpCode(204)
+  async deleteComment(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('commentId', ParseUUIDPipe) commentId: string,
+    @Body() dto: DeleteCommentDto,
+  ) {
+    await this.communityService.deleteComment(commentId, actor.id, dto.reason);
   }
 }

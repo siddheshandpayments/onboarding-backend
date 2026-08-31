@@ -40,6 +40,15 @@ export class OnboardingTasksController {
     return this.onboardingTasksService.claimTask(id, user);
   }
 
+  // Unclaimed owner/dual tasks matching the caller's own role — the
+  // list claimTask() has nothing to act against without.
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('task_owner')
+  @Get('claimable')
+  listClaimable(@CurrentUser() user: AuthenticatedUser) {
+    return this.onboardingTasksService.listClaimableTasks(user);
+  }
+
   // Step 20: TaskOwner dashboard. This one IS a fixed role — there's
   // no per-task ambiguity, it's just "show me what I've claimed." Step
   // 32: allow-listed status/priority/date-range filters, dueDate/

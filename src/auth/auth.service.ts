@@ -124,11 +124,16 @@ export class AuthService {
   // ============================================================
 
   private async resolveUserByIdentifier(identifier: string): Promise<UserRow> {
+    // No `!company_email_active` gate here on purpose: company_email is
+    // set (must_reset_password=true, active=false) the moment HR
+    // provisions it, and completeCompanyEmailPasswordReset is what
+    // flips active to true — but that step itself only runs after a
+    // successful login via the company email. Gating login on
+    // already-active would mean nothing could ever activate it.
+    // Blocking the TEMP identifier once active (below) is the actual
+    // cutover; this side just needs company_email to be set at all.
     const byCompanyEmail = await this.usersService.findByCompanyEmail(identifier);
     if (byCompanyEmail) {
-      if (!byCompanyEmail.company_email_active) {
-        throw new UnauthorizedException('Invalid credentials');
-      }
       return byCompanyEmail;
     }
 

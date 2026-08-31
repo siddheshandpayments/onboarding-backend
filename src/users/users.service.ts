@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { QueryResult, QueryResultRow } from 'pg';
 import { DatabaseService } from '../database/database.service';
+import { slugifyNameForCompanyEmail } from '../auth/utils/credential-generator';
 
 /** Same structural-typing trick as TemplatesService/OnboardingsService —
  *  lets recordCompanyEmail() run either standalone or as part of a
@@ -94,22 +95,54 @@ export class UsersService {
   }
 
   /** HR records the company email once IT/the company mail system has
-   *  issued it. This does NOT enable login with it yet — see the
-   *  users.company_email_active flip in AuthService on first successful
-   *  company-email login (Step 6). Accepts an optional queryable so
-   *  OnboardingsService.provisionCompanyEmail (Step 17) can run this in
-   *  the same transaction as its own onboardings.status flip. */
+   *  issued it, along with a fresh temp password for it — same
+   *  "admin-issued credential" shape as user creation, since logging
+   *  into a brand new company-email identity needs its own temp
+   *  password rather than reusing whatever the employee already
+   *  chose for their temp login. This does NOT enable login with it
+   *  yet — see the users.company_email_active flip in AuthService on
+   *  first successful company-email login (Step 6). Accepts an
+   *  optional queryable so OnboardingsService.provisionCompanyEmail
+   *  (Step 17) can run this in the same transaction as its own
+   *  onboardings.status flip. */
   async recordCompanyEmail(
     userId: string,
     companyEmail: string,
+    passwordHash: string,
     queryable: Queryable = this.db,
   ) {
     await queryable.query(
       `UPDATE users
-       SET company_email = $2, must_reset_password = true
+       SET company_email = $2, password_hash = $3, must_reset_password = true
        WHERE id = $1`,
-      [userId, companyEmail],
+      [userId, companyEmail, passwordHash],
     );
+  }
+
+  /** Deterministic collision handling for a REAL company email:
+   *  "Sam Row" -> samrow@domain, and if that's taken (another Sam Row)
+   *  -> samrow1@domain, samrow2@domain, ... — unlike the synthetic
+   *  temp login's random suffix, this has to read as a normal address
+   *  and stay stable, so it's an incrementing integer, not randomness.
+   *  Checked against the SAME queryable the caller inserts under, so
+   *  this can run inside OnboardingsService.provisionCompanyEmail's
+   *  transaction without racing a concurrent read outside it. */
+  async generateUniqueCompanyEmail(
+    fullName: string,
+    domain: string,
+    queryable: Queryable = this.db,
+  ): Promise<string> {
+    const base = slugifyNameForCompanyEmail(fullName);
+    let suffix = 0;
+    while (true) {
+      const candidate = suffix === 0 ? `${base}@${domain}` : `${base}${suffix}@${domain}`;
+      const { rows } = await queryable.query<{ id: string }>(
+        `SELECT id FROM users WHERE company_email = $1`,
+        [candidate],
+      );
+      if (rows.length === 0) return candidate;
+      suffix++;
+    }
   }
 
   /** Overwrites the password hash. forceReset=true (the default for any

@@ -70,3 +70,61 @@ export function parseSort(
   }
   return { field, direction: descending ? 'DESC' : 'ASC' };
 }
+
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
+
+export interface Pagination {
+  limit: number;
+  offset: number;
+}
+
+/** Step 33: LIMIT/OFFSET on every list endpoint. `limit` defaults to
+ *  20, capped at 100 so a client can't force an unbounded scan; `offset`
+ *  defaults to 0. Both are validated, not just parsed — a non-integer
+ *  or out-of-range value is a 400, same "reject, don't silently
+ *  coerce" stance as assertOnlyAllowedKeys above. */
+export function parsePagination(query: { limit?: string; offset?: string }): Pagination {
+  let limit = DEFAULT_LIMIT;
+  if (query.limit !== undefined) {
+    const parsed = Number(query.limit);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_LIMIT) {
+      throw new BadRequestException(`'limit' must be an integer between 1 and ${MAX_LIMIT}`);
+    }
+    limit = parsed;
+  }
+  let offset = 0;
+  if (query.offset !== undefined) {
+    const parsed = Number(query.offset);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new BadRequestException(`'offset' must be a non-negative integer`);
+    }
+    offset = parsed;
+  }
+  return { limit, offset };
+}
+
+export interface PaginatedResult<T> {
+  data: T[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/**
+ * Every paginated query in this codebase adds `COUNT(*) OVER()::int AS
+ * total_count` to its SELECT list — one round trip gets both this
+ * page's rows and the total matching count, rather than a separate
+ * COUNT query. This strips that pseudo-column back out of each row and
+ * wraps the page in a {data, total, limit, offset} envelope, so a
+ * caller can tell whether there's more to page through instead of
+ * just receiving a silently-truncated list.
+ */
+export function paginateRows<T extends { total_count?: number }>(
+  rows: T[],
+  pagination: Pagination,
+): PaginatedResult<Omit<T, 'total_count'>> {
+  const total = rows[0]?.total_count ?? 0;
+  const data = rows.map(({ total_count, ...rest }) => rest);
+  return { data, total, limit: pagination.limit, offset: pagination.offset };
+}

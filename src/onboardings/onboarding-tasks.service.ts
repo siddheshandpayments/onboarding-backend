@@ -15,6 +15,8 @@ import {
   assertOneOfIfPresent,
   assertOnlyAllowedKeys,
   parseSort,
+  parsePagination,
+  paginateRows,
 } from '../common/list-query.util';
 
 const TASK_STATUS_VALUES = [
@@ -230,15 +232,24 @@ export class OnboardingTasksService {
    * outside that list rather than silently ignore it.
    */
   async listMyTasks(actor: AuthenticatedUser, query: Record<string, string | undefined>) {
-    assertOnlyAllowedKeys(query, ['status', 'priority', 'dateFrom', 'dateTo', 'sort']);
+    assertOnlyAllowedKeys(query, [
+      'status',
+      'priority',
+      'dateFrom',
+      'dateTo',
+      'sort',
+      'limit',
+      'offset',
+    ]);
     assertOneOfIfPresent(query.status, 'status', TASK_STATUS_VALUES);
     assertOneOfIfPresent(query.priority, 'priority', PRIORITY_VALUES);
     assertDateIfPresent(query.dateFrom, 'dateFrom');
     assertDateIfPresent(query.dateTo, 'dateTo');
     const { field, direction } = parseSort(query.sort, Object.keys(TASK_SORT_EXPRESSIONS), 'dueDate');
+    const pagination = parsePagination(query);
 
     const { rows } = await this.db.query(
-      `SELECT * FROM (
+      `SELECT *, COUNT(*) OVER()::int AS total_count FROM (
          SELECT
            ot.id, ot.onboarding_id, ot.title, ot.description, ot.due_date,
            ot.priority, ot.status, ot.completion_mode, ot.is_checkpoint,
@@ -256,8 +267,42 @@ export class OnboardingTasksService {
            AND ($4::date IS NULL OR ot.due_date >= $4)
            AND ($5::date IS NULL OR ot.due_date <= $5)
        ) AS task_rows
-       ORDER BY ${TASK_SORT_EXPRESSIONS[field]} ${direction}`,
-      [actor.id, query.status ?? null, query.priority ?? null, query.dateFrom ?? null, query.dateTo ?? null],
+       ORDER BY ${TASK_SORT_EXPRESSIONS[field]} ${direction}
+       LIMIT $6 OFFSET $7`,
+      [
+        actor.id,
+        query.status ?? null,
+        query.priority ?? null,
+        query.dateFrom ?? null,
+        query.dateTo ?? null,
+        pagination.limit,
+        pagination.offset,
+      ],
+    );
+    return paginateRows(rows, pagination);
+  }
+
+  /** The other half of claimTask(): what a task_owner can see to claim
+   *  in the first place. Same actionability rules as claimTask itself
+   *  (not locked/cancelled/completed, has an owner side, unclaimed,
+   *  role matches) so nothing shown here would fail if claimed. */
+  async listClaimableTasks(actor: AuthenticatedUser) {
+    const { rows } = await this.db.query(
+      `SELECT
+         ot.id, ot.onboarding_id, ot.title, ot.description, ot.due_date,
+         ot.priority, ot.status, ot.completion_mode, ot.is_checkpoint,
+         u.full_name AS employee_name,
+         d.name AS department_name
+       FROM onboarding_tasks ot
+       JOIN onboardings o ON o.id = ot.onboarding_id
+       JOIN users u ON u.id = o.user_id
+       JOIN departments d ON d.id = o.department_id
+       WHERE ot.owner_role = $1
+         AND ot.owner_user_id IS NULL
+         AND ot.completion_mode != 'employee'
+         AND ot.status NOT IN ('locked', 'cancelled', 'completed')
+       ORDER BY ot.due_date ASC`,
+      [actor.role],
     );
     return rows;
   }

@@ -10,6 +10,7 @@ import { UsersService } from '../users/users.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateEntitlementDto } from './dto/create-entitlement.dto';
+import { Pagination, paginateRows } from '../common/list-query.util';
 
 export interface EntitlementRow {
   id: string;
@@ -78,18 +79,21 @@ export class EntitlementsService {
   /** What the caller could claim: active entitlements that are either
    *  company-wide or scoped to the caller's own department — derived
    *  from their own user record, never a client-supplied department. */
-  async listVisibleForActor(actor: AuthenticatedUser) {
+  /** Step 33: LIMIT/OFFSET pagination via the shared
+   *  COUNT(*) OVER()/paginateRows() pattern. */
+  async listVisibleForActor(actor: AuthenticatedUser, pagination: Pagination) {
     const user = await this.usersService.findById(actor.id);
     const departmentId = user?.department_id ?? null;
 
-    const { rows } = await this.db.query<EntitlementRow>(
-      `SELECT * FROM entitlements
+    const { rows } = await this.db.query<EntitlementRow & { total_count: number }>(
+      `SELECT *, COUNT(*) OVER()::int AS total_count FROM entitlements
        WHERE status = 'active'
          AND (scope = 'company_wide' OR department_id = $1)
-       ORDER BY name`,
-      [departmentId],
+       ORDER BY name
+       LIMIT $2 OFFSET $3`,
+      [departmentId, pagination.limit, pagination.offset],
     );
-    return rows;
+    return paginateRows(rows, pagination);
   }
 
   /**
