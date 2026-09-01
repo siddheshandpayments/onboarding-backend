@@ -45,18 +45,6 @@ export class AuthController {
   }
 
   @UseGuards(PreAuthGuard)
-  @Post('totp/enroll')
-  startTotpEnrollment(@PreAuthUser() ctx: PreAuthContext) {
-    return this.authService.startTotpEnrollment(ctx.userId);
-  }
-
-  @UseGuards(PreAuthGuard)
-  @Post('totp/enroll/confirm')
-  confirmTotpEnrollment(@PreAuthUser() ctx: PreAuthContext, @Body() dto: TotpCodeDto) {
-    return this.authService.confirmTotpEnrollment(ctx.userId, dto.code);
-  }
-
-  @UseGuards(PreAuthGuard)
   @Post('totp/verify')
   verifyTotp(@PreAuthUser() ctx: PreAuthContext, @Body() dto: TotpCodeDto) {
     return this.authService.verifyTotpForLogin(ctx.userId, dto.code);

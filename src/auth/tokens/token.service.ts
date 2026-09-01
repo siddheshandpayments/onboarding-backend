@@ -12,6 +12,7 @@ export interface PreAuthPayload {
 export interface AccessPayload {
   sub: string;
   role: string;
+  departmentId: string | null;
   type: 'access';
 }
 
@@ -58,8 +59,13 @@ export class TokenService {
 
   // ---- access (real bearer credential) ----
 
-  signAccessToken(user: Pick<UserRow, 'id' | 'role'>): string {
-    const payload: AccessPayload = { sub: user.id, role: user.role, type: 'access' };
+  signAccessToken(user: Pick<UserRow, 'id' | 'role' | 'department_id'>): string {
+    const payload: AccessPayload = {
+      sub: user.id,
+      role: user.role,
+      departmentId: user.department_id,
+      type: 'access',
+    };
     return this.jwt.sign(payload, {
       secret: this.config.get<string>('JWT_ACCESS_SECRET'),
       expiresIn: this.config.get<string>('JWT_ACCESS_EXPIRES_IN'),

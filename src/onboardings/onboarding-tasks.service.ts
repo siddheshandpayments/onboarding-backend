@@ -5,11 +5,12 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { PoolClient } from 'pg';
+import { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { DatabaseService } from '../database/database.service';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { isOverdueSql } from './utils/overdue.util';
+import { AssignTaskDto } from './dto/assign-task.dto';
 import {
   assertDateIfPresent,
   assertOneOfIfPresent,
@@ -18,6 +19,16 @@ import {
   parsePagination,
   paginateRows,
 } from '../common/list-query.util';
+
+/** Same structural-typing trick as OnboardingsService/TemplatesService —
+ *  lets maybeCompleteOnboarding run against either the pooled
+ *  DatabaseService or a transaction's PoolClient. */
+interface Queryable {
+  query<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    params?: unknown[],
+  ): Promise<QueryResult<T>>;
+}
 
 const TASK_STATUS_VALUES = [
   'locked',
@@ -307,6 +318,121 @@ export class OnboardingTasksService {
     return rows;
   }
 
+  /**
+   * A task owner's own department roster — every onboarding whose
+   * department_id matches the caller's department_id (from their JWT,
+   * never a client-supplied value), same required-task progress counts
+   * as HR's company-wide listAllOnboardings. A task owner with no
+   * department set gets an empty list rather than an error — there's
+   * nothing to scope to. Newest-started employee first, so a task
+   * owner sees their most recently joined reports up top.
+   */
+  async listDepartmentOnboardings(actor: AuthenticatedUser) {
+    if (!actor.departmentId) {
+      return [];
+    }
+    const { rows } = await this.db.query(
+      `SELECT
+         o.id, o.status, o.start_date, o.created_at,
+         u.full_name AS employee_name,
+         (
+           SELECT COUNT(*) FROM onboarding_tasks ot
+           WHERE ot.onboarding_id = o.id AND ot.is_required = true
+         )::int AS required_task_count,
+         (
+           SELECT COUNT(*) FROM onboarding_tasks ot
+           WHERE ot.onboarding_id = o.id AND ot.is_required = true AND ot.status = 'completed'
+         )::int AS required_task_completed_count
+       FROM onboardings o
+       JOIN users u ON u.id = o.user_id
+       WHERE o.department_id = $1
+       ORDER BY o.created_at DESC`,
+      [actor.departmentId],
+    );
+    return rows;
+  }
+
+  /**
+   * A task owner assigning an ad-hoc task onto one onboarding in their
+   * own department — the task-owner-scoped counterpart to HR's
+   * OnboardingsService.createAdHocTask. Restricted to the caller's own
+   * department (403, not 404, if the onboarding exists but belongs to
+   * someone else's — same "don't confirm/deny existence differently"
+   * stance as NotesService). Fixed server-side, unlike HR's version:
+   * owner_role is always 'task_owner', completion_mode is always
+   * 'owner' (a task the assigning owner alone closes), never a
+   * checkpoint, not required (it's extra, outside the template's
+   * mandatory checklist — never gates the "steps"/progress view), and
+   * auto-claimed by the assigner so it shows up on their own "My tasks"
+   * immediately rather than sitting in claimable for someone else.
+   */
+  async assignTaskByOwner(actor: AuthenticatedUser, dto: AssignTaskDto) {
+    const { rows: onboardingRows } = await this.db.query<{ department_id: string }>(
+      `SELECT department_id FROM onboardings WHERE id = $1`,
+      [dto.onboardingId],
+    );
+    const onboarding = onboardingRows[0];
+    if (!onboarding) {
+      throw new NotFoundException('Onboarding not found');
+    }
+    if (!actor.departmentId || onboarding.department_id !== actor.departmentId) {
+      throw new ForbiddenException('You can only assign tasks within your own department');
+    }
+
+    const { rows } = await this.db.query<OnboardingTaskRow>(
+      `INSERT INTO onboarding_tasks (
+         onboarding_id, source_template_task_id, title, description,
+         owner_role, owner_user_id, due_date, priority, is_required,
+         completion_mode, is_checkpoint, status
+       ) VALUES ($1, NULL, $2, $3, 'task_owner', $4, $5, $6, false, 'owner', false, 'pending')
+       RETURNING *`,
+      [
+        dto.onboardingId,
+        dto.title,
+        dto.description ?? null,
+        actor.id,
+        dto.dueDate,
+        dto.priority ?? 'normal',
+      ],
+    );
+
+    await this.activityLog.log({
+      actorId: actor.id,
+      action: 'onboarding_task.assigned_by_owner',
+      entityType: 'onboarding_task',
+      entityId: rows[0].id,
+      metadata: { onboardingId: dto.onboardingId, title: dto.title },
+    });
+
+    return rows[0];
+  }
+
+  /**
+   * Checked after any completion that could be the LAST required task
+   * on an onboarding: if none remain outstanding, the onboarding itself
+   * advances to 'completed'. Without this, onboardings.status simply
+   * never reaches 'completed' — it would sit at 'active' forever even
+   * once every required task is done, which is exactly what stalls the
+   * frontend's JourneyTrack (driven off onboarding.status, not the
+   * numeric percent) short of its final stage. The WHERE status =
+   * 'active' guard makes this a no-op if the onboarding was already
+   * completed/cancelled, and safe to call unconditionally — from
+   * multiple concurrent completions — without a transaction of its own.
+   */
+  private async maybeCompleteOnboarding(queryable: Queryable, onboardingId: string) {
+    const { rows } = await queryable.query<{ remaining: string }>(
+      `SELECT COUNT(*)::int AS remaining FROM onboarding_tasks
+       WHERE onboarding_id = $1 AND is_required = true AND status <> 'completed'`,
+      [onboardingId],
+    );
+    if (Number(rows[0].remaining) === 0) {
+      await queryable.query(
+        `UPDATE onboardings SET status = 'completed' WHERE id = $1 AND status = 'active'`,
+        [onboardingId],
+      );
+    }
+  }
+
   private async getActionableTaskOrThrow(taskId: string): Promise<OnboardingTaskRow> {
     const { rows } = await this.db.query<OnboardingTaskRow>(
       `SELECT * FROM onboarding_tasks WHERE id = $1`,
@@ -374,6 +500,10 @@ export class OnboardingTasksService {
       entityId: taskId,
     });
 
+    if (rows[0].status === 'completed' && rows[0].is_required) {
+      await this.maybeCompleteOnboarding(this.db, rows[0].onboarding_id);
+    }
+
     return rows[0];
   }
 
@@ -433,6 +563,10 @@ export class OnboardingTasksService {
       if (task.status === 'completed' && task.is_checkpoint) {
         await this.unlockPhaseTwoTasks(client, task.onboarding_id);
         await this.activateOnboarding(client, task.onboarding_id);
+      }
+
+      if (task.status === 'completed' && task.is_required) {
+        await this.maybeCompleteOnboarding(client, task.onboarding_id);
       }
 
       return task;

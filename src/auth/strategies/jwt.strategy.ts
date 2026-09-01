@@ -7,6 +7,7 @@ import { AccessPayload } from '../tokens/token.service';
 export interface AuthenticatedUser {
   id: string;
   role: 'superadmin_hr' | 'task_owner' | 'employee';
+  departmentId: string | null;
 }
 
 @Injectable()
@@ -26,6 +27,10 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt-access') {
       // secrets are ever shared across token kinds down the line.
       throw new UnauthorizedException('Invalid token for this operation');
     }
-    return { id: payload.sub, role: payload.role as AuthenticatedUser['role'] };
+    return {
+      id: payload.sub,
+      role: payload.role as AuthenticatedUser['role'],
+      departmentId: payload.departmentId,
+    };
   }
 }

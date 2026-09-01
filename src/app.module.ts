@@ -14,6 +14,7 @@ import { NotesModule } from './notes/notes.module';
 import { ActivityLogModule } from './activity-log/activity-log.module';
 import { CommunityModule } from './community/community.module';
 import { DocumentsModule } from './documents/documents.module';
+import { DiaryModule } from './diary/diary.module';
 
 import { AllExceptionsFilter } from './common/all-exceptions.filter';
 
@@ -38,6 +39,7 @@ import { AllExceptionsFilter } from './common/all-exceptions.filter';
     NotesModule,
     CommunityModule,
     DocumentsModule,
+    DiaryModule,
 
     // Remaining feature modules get added here as later steps build them.
   ],

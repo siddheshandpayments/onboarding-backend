@@ -1,10 +1,11 @@
-import { Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
 import { OnboardingTasksService } from './onboarding-tasks.service';
+import { AssignTaskDto } from './dto/assign-task.dto';
 
 @Controller('onboarding-tasks')
 export class OnboardingTasksController {
@@ -62,5 +63,25 @@ export class OnboardingTasksController {
     @Query() query: Record<string, string | undefined>,
   ) {
     return this.onboardingTasksService.listMyTasks(user, query);
+  }
+
+  // Every onboarding in the caller's own department, with the same
+  // progress counts as HR's company-wide list — scoped server-side to
+  // the department on the caller's own JWT, never a client-supplied id.
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('task_owner')
+  @Get('department-onboardings')
+  listDepartmentOnboardings(@CurrentUser() user: AuthenticatedUser) {
+    return this.onboardingTasksService.listDepartmentOnboardings(user);
+  }
+
+  // A task owner scheduling an ad-hoc task onto one onboarding in their
+  // own department — restricted to that department in the service, not
+  // just here.
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('task_owner')
+  @Post('assign')
+  assign(@CurrentUser() user: AuthenticatedUser, @Body() dto: AssignTaskDto) {
+    return this.onboardingTasksService.assignTaskByOwner(user, dto);
   }
 }

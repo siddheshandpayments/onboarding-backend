@@ -11,7 +11,7 @@ import { DatabaseService } from '../database/database.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { generateLoginEmail, generateTempPassword } from './utils/credential-generator';
-import { generateTotpEnrollment, verifyTotpCode } from './utils/totp';
+import { verifyTotpCode } from './utils/totp';
 import { TokenService } from './tokens/token.service';
 
 const BCRYPT_ROUNDS = 12;
@@ -151,15 +151,16 @@ export class AuthService {
   }
 
   /** Computes what's still outstanding from persistent DB state alone.
-   *  requiresTotpVerification here means "TOTP is enrolled and would
-   *  need checking in a fresh session" — whether THIS session already
-   *  did that check is tracked separately via the pre-auth token's
-   *  totpVerified claim, not by anything in the database. */
+   *  There's no authenticator-app enrollment step at all — every
+   *  account is always treated as already "enrolled" against the one
+   *  fixed login code, so requiresTotpEnrollment is always false and
+   *  requiresTotpVerification (checked once per session, same as
+   *  before) is always true. */
   private authRequirementsFor(user: UserRow) {
     return {
       requiresPasswordReset: user.must_reset_password,
-      requiresTotpEnrollment: !user.totp_enrolled_at,
-      requiresTotpVerification: !!user.totp_enrolled_at,
+      requiresTotpEnrollment: false,
+      requiresTotpVerification: true,
     };
   }
 
@@ -221,49 +222,10 @@ export class AuthService {
     return this.progressFor(user.id, false);
   }
 
-  async startTotpEnrollment(userId: string) {
-    const user = await this.usersService.findById(userId);
-    if (!user) throw new NotFoundException('User not found');
-    if (user.totp_enrolled_at) {
-      throw new ForbiddenException('TOTP is already enrolled for this account');
-    }
-
-    const issuer = this.config.get<string>('TOTP_ISSUER')!;
-    const accountLabel = user.company_email_active
-      ? user.company_email!
-      : user.temp_login_email;
-
-    const enrollment = await generateTotpEnrollment(accountLabel, issuer);
-    await this.usersService.setPendingTotpSecret(userId, enrollment.secret);
-
-    return {
-      otpauthUri: enrollment.otpauthUri,
-      qrCodeDataUrl: enrollment.qrCodeDataUrl,
-    };
-  }
-
-  async confirmTotpEnrollment(userId: string, code: string): Promise<AuthProgress> {
-    const user = await this.usersService.findById(userId);
-    if (!user) throw new NotFoundException('User not found');
-    if (!user.totp_secret) {
-      throw new ForbiddenException('No pending TOTP enrollment for this account');
-    }
-    if (!verifyTotpCode(code, user.totp_secret)) {
-      throw new UnauthorizedException('Invalid code');
-    }
-
-    await this.usersService.markTotpEnrolled(userId);
-    // Confirming enrollment inherently proves a valid code was entered
-    // this session, so it satisfies the steady-state TOTP check too.
-    return this.progressFor(userId, true);
-  }
-
   async verifyTotpForLogin(userId: string, code: string): Promise<AuthProgress> {
     const user = await this.usersService.findById(userId);
-    if (!user || !user.totp_secret || !user.totp_enrolled_at) {
-      throw new ForbiddenException('TOTP is not enrolled for this account');
-    }
-    if (!verifyTotpCode(code, user.totp_secret)) {
+    if (!user) throw new NotFoundException('User not found');
+    if (!verifyTotpCode(code)) {
       throw new UnauthorizedException('Invalid code');
     }
     return this.progressFor(userId, true);

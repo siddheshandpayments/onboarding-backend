@@ -159,23 +159,6 @@ export class UsersService {
     );
   }
 
-  /** Stores a freshly-generated TOTP secret, pending confirmation
-   *  (totp_enrolled_at stays NULL until the user proves they can
-   *  generate a valid code from it). */
-  async setPendingTotpSecret(userId: string, secret: string) {
-    await this.db.query(
-      `UPDATE users SET totp_secret = $2, totp_enrolled_at = NULL WHERE id = $1`,
-      [userId, secret],
-    );
-  }
-
-  async markTotpEnrolled(userId: string) {
-    await this.db.query(
-      `UPDATE users SET totp_enrolled_at = now() WHERE id = $1`,
-      [userId],
-    );
-  }
-
   async setCompanyEmailActive(userId: string) {
     await this.db.query(
       `UPDATE users SET company_email_active = true WHERE id = $1`,
